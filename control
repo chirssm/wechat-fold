@@ -1,0 +1,9 @@
+Package: com.yourname.wechatfold
+Name: WeChatFold
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: 微信群聊批量折叠（TrollStore / 巨魔注入版，纯 runtime 实现）
+Maintainer: yourname
+Author: yourname
+Section: Tweaks
+Depends: mobilesubstrate

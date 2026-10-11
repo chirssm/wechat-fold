@@ -1,0 +1,50 @@
+name: Build WeChatFold
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos dependencies
+        run: |
+          brew install ldid xz make
+
+      - name: Clone Theos
+        run: |
+          export THEOS=~/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          echo "THEOS=~/theos" >> $GITHUB_ENV
+
+      - name: Download iOS SDK
+        run: |
+          curl -L -o sdks.zip https://github.com/theos/sdks/archive/master.zip
+          unzip -q sdks.zip
+          mkdir -p ~/theos/sdks
+          cp -R sdks-master/*.sdk ~/theos/sdks/ || true
+          ls ~/theos/sdks
+
+      - name: Build dylib
+        run: |
+          export PATH=$PATH:~/theos/bin
+          make clean || true
+          make
+
+      - name: Package deb
+        run: |
+          make package
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatFold
+          path: |
+            .theos/obj/*.dylib
+            packages/*.deb
+          if-no-files-found: warn
