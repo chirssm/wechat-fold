@@ -1,6 +1,19 @@
 //
-//  WeChatFold.m  v8
+//  WeChatFold.m  v9
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
+//
+//  v9 变更（针对「选择朋友」页定位失败）：
+//  1. 【关键修复】v8 的黑名单里有 "Contact"，而「选择朋友」页的类名几乎必然
+//     含 Contact，导致页面在匹配前就被自己拦掉了。黑名单收窄为真正不能碰的
+//     几类页面（聊天窗口/主界面/设置/朋友圈/登录）。
+//  2. 标题提取不再只看 vc.title：改为收集「导航栏全部文字 + titleView +
+//     navigationItem」，微信自定义导航栏也能拿到「选择朋友」。
+//  3. 新增结构兜底判定：有搜索框 + 有「完成/确定/下一步」按钮 + 列表够长，
+//     也算多选页。
+//  4. 幂等注入：每次扫描都检查按钮还在不在，微信重设导航栏后会自动补回。
+//  5. 「全选」升级为「智能全选」：逐行判断是不是群聊（会话名以 @chatroom 结尾
+//     或带群成员数），只勾群聊行；识别不出来时退回全选并明确告知。
+//  6. 再次点击变为「取消全选」，靠自身状态判断，不依赖微信内部记录。
 //
 //  v8 变更（换思路：复用微信官方折叠机制，不碰内部 API）：
 //  1. 新增「页面扫描」：每 1.5 秒检查当前最顶层页面，若不是已知页面则记录
@@ -48,7 +61,7 @@
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
 
 // 版本号：日志、启动弹窗、设置页入口都会显示，用来确认新 dylib 是否真的装上
-static NSString * const kWFVersion = @"v8";
+static NSString * const kWFVersion = @"v9";
 
 // 设置页候选类名（只在这里注入入口）
 static NSArray<NSString *> *WFSettingCandidates(void) {
@@ -240,9 +253,9 @@ static UITableView *WFFindTableViewIn(UIView *root) {
     return nil;
 }
 
-// 找到当前最顶层的可见控制器（穿透 present / nav / tab）
+// 找到当前最顶层的可见控制器（穿透 present / nav / tab / 容器 VC）
 static UIViewController *WFDeepestVC(UIViewController *vc, int depth) {
-    if (!vc || depth > 8) return vc;
+    if (!vc || depth > 10) return vc;
     if (vc.presentedViewController) return WFDeepestVC(vc.presentedViewController, depth + 1);
     if ([vc isKindOfClass:[UINavigationController class]]) {
         UIViewController *top = ((UINavigationController *)vc).topViewController;
@@ -252,6 +265,12 @@ static UIViewController *WFDeepestVC(UIViewController *vc, int depth) {
         UIViewController *sel = ((UITabBarController *)vc).selectedViewController;
         if (sel && sel != vc) return WFDeepestVC(sel, depth + 1);
     }
+    // 容器 VC：继续下沉到最后一个「已上屏」的子控制器
+    UIViewController *last = nil;
+    for (UIViewController *c in vc.childViewControllers) {
+        if (c.view && c.view.window) last = c;
+    }
+    if (last && last != vc) return WFDeepestVC(last, depth + 1);
     return vc;
 }
 
@@ -259,6 +278,185 @@ static UIViewController *WFTopViewController(void) {
     UIWindow *w = WFKeyWindow();
     if (!w) return nil;
     return WFDeepestVC(w.rootViewController, 0);
+}
+
+// 递归收集一段视图里的全部可见文字（UILabel / UIButton）
+static void WFCollectTexts(UIView *v, NSMutableArray<NSString *> *out, int depth) {
+    if (!v || depth > 8 || out.count >= 30) return;
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t.length && t.length <= 40 && ![out containsObject:t]) [out addObject:t];
+    } else if ([v isKindOfClass:[UIButton class]]) {
+        NSString *t = [((UIButton *)v) titleForState:UIControlStateNormal];
+        if (!t.length) t = [((UIButton *)v) titleForState:UIControlStateSelected];
+        if (t.length && t.length <= 40 && ![out containsObject:t]) [out addObject:t];
+    }
+    for (UIView *s in v.subviews) WFCollectTexts(s, out, depth + 1);
+}
+
+// 在视图树里找导航栏（微信有自定义导航栏，不一定挂在 vc.navigationController 上）
+static UINavigationBar *WFFindNavBar(UIView *root, int depth) {
+    if (!root || depth > 12) return nil;
+    if ([root isKindOfClass:[UINavigationBar class]]) return (UINavigationBar *)root;
+    for (UIView *s in root.subviews) {
+        UINavigationBar *b = WFFindNavBar(s, depth + 1);
+        if (b) return b;
+    }
+    return nil;
+}
+
+// 当前页面「能被用户看到的全部文字」：标题属性 + titleView + 导航栏实际文字
+static NSArray<NSString *> *WFPageTexts(UIViewController *vc) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    if (!vc) return out;
+    if (vc.title.length) [out addObject:vc.title];
+    NSString *nit = vc.navigationItem.title;
+    if (nit.length && ![out containsObject:nit]) [out addObject:nit];
+    if (vc.navigationItem.titleView) WFCollectTexts(vc.navigationItem.titleView, out, 0);
+
+    UINavigationBar *bar = vc.navigationController.navigationBar;
+    if (!bar) {
+        UIWindow *w = WFKeyWindow();
+        if (w) bar = WFFindNavBar(w, 0);
+    }
+    if (bar) {
+        WFCollectTexts(bar, out, 0);
+        UINavigationItem *it = bar.topItem;
+        if (it.title.length && ![out containsObject:it.title]) [out addObject:it.title];
+        for (UIBarButtonItem *b in it.rightBarButtonItems) {
+            if (b.title.length && ![out containsObject:b.title]) [out addObject:b.title];
+        }
+        if (it.rightBarButtonItem.title.length && ![out containsObject:it.rightBarButtonItem.title]) {
+            [out addObject:it.rightBarButtonItem.title];
+        }
+    }
+    return out;
+}
+
+// 带缓存的取文字：同一个页面不重复遍历视图树
+static NSArray<NSString *> *WFPageTextsCached(UIViewController *vc) {
+    static __weak UIViewController *cachedVC = nil;
+    static NSArray<NSString *> *cachedTexts = nil;
+    if (cachedVC == vc && cachedTexts.count) return cachedTexts;
+    NSArray<NSString *> *t = WFPageTexts(vc);
+    cachedVC = vc;
+    cachedTexts = t;
+    return t;
+}
+
+// 找搜索框（多选页几乎都有）
+static UIView *WFFindSearchBarIn(UIView *root, int depth) {
+    if (!root || depth > 9) return nil;
+    if ([root isKindOfClass:[UISearchBar class]]) return root;
+    NSString *cn = NSStringFromClass([root class]);
+    if ([cn containsString:@"SearchBar"]) return root;
+    for (UIView *s in root.subviews) {
+        UIView *r = WFFindSearchBarIn(s, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+// 递归判断一个对象（会话 / 联系人 / 视图模型）是不是群聊
+// 判据：任何一处字符串以 @chatroom 结尾，或带群成员数字段
+static BOOL WFObjectHasChatroomTag(id obj, int depth) {
+    if (!obj || depth > 3) return NO;
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)obj;
+        return [s hasSuffix:@"@chatroom"] || [s hasSuffix:@"@im.chatroom"];
+    }
+    if ([obj isKindOfClass:[NSNumber class]] || [obj isKindOfClass:[NSNull class]]) return NO;
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *a = (NSArray *)obj;
+        if (a.count > 400) return NO;
+        for (id o in a) if (WFObjectHasChatroomTag(o, depth + 1)) return YES;
+        return NO;
+    }
+    if ([obj isKindOfClass:[NSSet class]]) {
+        NSSet *st = (NSSet *)obj;
+        if (st.count > 400) return NO;
+        for (id o in st) if (WFObjectHasChatroomTag(o, depth + 1)) return YES;
+        return NO;
+    }
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        if (d.count > 200) return NO;
+        for (id k in d) {
+            if (WFObjectHasChatroomTag(k, depth + 1)) return YES;
+            if (WFObjectHasChatroomTag(d[k], depth + 1)) return YES;
+        }
+        return NO;
+    }
+    // 普通对象：扫 @ 类型的 ivar
+    unsigned int ic = 0;
+    Ivar *ivs = class_copyIvarList([obj class], &ic);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < ic && !found; i++) {
+        const char *te = ivar_getTypeEncoding(ivs[i]) ?: "";
+        if (te[0] != '@') continue;
+        id v = nil;
+        @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { continue; }
+        if (!v || v == obj) continue;
+        if (WFObjectHasChatroomTag(v, depth + 1)) found = YES;
+    }
+    free(ivs);
+    return found;
+}
+
+// 从 dataSource 的数组 ivar 里按行取数据对象
+static id WFObjectForRow(id ds, NSIndexPath *ip) {
+    if (!ds || !ip) return nil;
+    unsigned int ic = 0;
+    Ivar *ivs = class_copyIvarList([ds class], &ic);
+    NSArray *hit = nil;
+    for (unsigned int i = 0; i < ic; i++) {
+        const char *te = ivar_getTypeEncoding(ivs[i]) ?: "";
+        if (te[0] != '@') continue;
+        NSString *tes = [NSString stringWithUTF8String:te];
+        if (!tes) continue;
+        if (!([tes containsString:@"NSArray"] || [tes containsString:@"NSMutableArray"])) continue;
+        id v = nil;
+        @try { v = object_getIvar(ds, ivs[i]); } @catch (NSException *e) { continue; }
+        if (![v isKindOfClass:[NSArray class]]) continue;
+        NSArray *a = (NSArray *)v;
+        if (a.count <= (NSUInteger)ip.row) continue;
+        id first = [a firstObject];
+        if (!first || [first isKindOfClass:[NSString class]] || [first isKindOfClass:[NSNumber class]]) continue;
+        hit = a;
+        break;
+    }
+    free(ivs);
+    if (!hit || ip.section != 0) return nil;
+    return hit[ip.row];
+}
+
+// 判断某一行是不是群聊：1=是  0=不是  -1=判断不出来
+static NSInteger WFRowChatroomState(UITableView *tv, NSIndexPath *ip) {
+    @try {
+        id obj = WFObjectForRow(tv.dataSource, ip);
+        if (obj) return WFObjectHasChatroomTag(obj, 0) ? 1 : 0;
+        UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
+        if (cell) {
+            unsigned int ic = 0;
+            Ivar *ivs = class_copyIvarList([cell class], &ic);
+            NSInteger st = -1;
+            for (unsigned int i = 0; i < ic && st < 0; i++) {
+                const char *te = ivar_getTypeEncoding(ivs[i]) ?: "";
+                if (te[0] != '@') continue;
+                id v = nil;
+                @try { v = object_getIvar(cell, ivs[i]); } @catch (NSException *e) { continue; }
+                if (!v || [v isKindOfClass:[NSString class]] || [v isKindOfClass:[NSNumber class]]) continue;
+                NSString *vn = NSStringFromClass([v class]);
+                if ([vn containsString:@"Label"] || [vn containsString:@"View"] ||
+                    [vn containsString:@"Button"] || [vn containsString:@"Image"] ||
+                    [vn containsString:@"Layout"] || [vn containsString:@"Layer"]) continue;
+                st = WFObjectHasChatroomTag(v, 0) ? 1 : 0;
+            }
+            free(ivs);
+            if (st >= 0) return st;
+        }
+    } @catch (NSException *e) { }
+    return -1;
 }
 
 #pragma mark - 对象 dump
@@ -812,9 +1010,11 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 @interface WFManager : NSObject
 @property (nonatomic, weak) UIViewController *lastVC;
 @property (nonatomic, weak) UIViewController *lastSettingVC;
-@property (nonatomic, weak) UIViewController *lastScannedVC;
 @property (nonatomic, weak) UITableView *pickerTable;
+@property (nonatomic, weak) UIViewController *pickerVC;
 @property (nonatomic, assign) BOOL pickerIsStrict;
+@property (nonatomic, assign) BOOL selectAllDone;
+@property (nonatomic, copy) NSString *pickerPageKey;
 + (instancetype)shared;
 - (void)injectSettingEntry:(UIViewController *)vc;
 - (void)showMenuFrom:(UIViewController *)vc;
@@ -824,8 +1024,16 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 - (void)closeLog;
 - (void)alert:(NSString *)msg from:(UIViewController *)vc;
 - (void)scanTopPage;
+- (BOOL)isSelectListPage:(UIViewController *)vc
+               tableView:(UITableView *)tv
+                   texts:(NSArray<NSString *> *)texts
+                isStrict:(BOOL *)strict;
 - (void)onSelectAllTap;
-- (void)performSelectAll:(UITableView *)tv;
+- (NSString *)pageDisplayName:(UIViewController *)vc;
+- (void)performSelectAll:(UITableView *)tv
+                deselect:(BOOL)deselect
+             chatroomOnly:(BOOL)chatroomOnly
+                  states:(NSDictionary<NSNumber *, NSNumber *> *)states;
 @end
 
 @implementation WFManager
@@ -1117,125 +1325,248 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 
 #pragma mark 页面扫描（给「选择群聊」页挂「全选」）
 
-// 判断是不是「选择群聊」这类多选页面
-- (BOOL)isSelectListPage:(UIViewController *)vc tableView:(UITableView *)tv title:(NSString *)title strict:(BOOL *)strict {
-    if (!vc.navigationController) return NO;
+// 判断是不是「选择群聊 / 选择朋友」这类多选页面
+- (BOOL)isSelectListPage:(UIViewController *)vc
+               tableView:(UITableView *)tv
+                   texts:(NSArray<NSString *> *)texts
+                isStrict:(BOOL *)strict {
+    if (!vc) return NO;
     NSString *cls = NSStringFromClass([vc class]);
-    // 黑名单：聊天窗口、主界面、设置、搜索等，绝对不碰
-    NSArray<NSString *> *black = @[@"MsgContent", @"Message", @"Msg", @"Content",
-                                   @"MainFrame", @"MainViewController", @"TabBar",
-                                   @"Setting", @"Search", @"Contact", @"Moment",
-                                   @"Timeline", @"Profile", @"Login"];
+
+    // 窄黑名单：只排除真正绝对不能碰的页面
+    // （v8 把 "Contact" 也列进来是错的——「选择朋友」页类名就含 Contact，被自己拦掉了）
+    NSArray<NSString *> *black = @[@"MsgContent", @"BaseMsg", @"MainFrame", @"MMMain",
+                                   @"TabBar", @"Setting", @"Moment", @"Sns",
+                                   @"Login", @"SessionList", @"ChatList", @"Emoticon"];
     for (NSString *b in black) if ([cls containsString:b]) return NO;
 
-    NSInteger rows = [tv numberOfSections] > 0 ? [tv numberOfRowsInSection:0] : 0;
+    NSInteger sections = [tv numberOfSections];
+    NSInteger rows = sections > 0 ? [tv numberOfRowsInSection:0] : 0;
     if (rows < 2) return NO;
 
-    BOOL isStrict = [title containsString:@"选择"];
-    BOOL isLoose  = [title containsString:@"添加"] || [title containsString:@"群聊"] ||
-                    ([title containsString:@"折叠"] && [cls containsString:@"Select"]) ||
-                    [cls containsString:@"Select"];
-    if (!isStrict && !isLoose) return NO;
+    BOOL titleSelect = NO;
+    for (NSString *t in texts) if ([t containsString:@"选择"]) { titleSelect = YES; break; }
+
+    BOOL hasDone = NO;
+    for (NSString *t in texts) {
+        if ([t containsString:@"完成"] || [t containsString:@"确定"] ||
+            [t containsString:@"下一步"] || [t containsString:@"添加"] ||
+            [t containsString:@"保存"] || [t containsString:@"创建"]) { hasDone = YES; break; }
+    }
+
+    BOOL hasSearch = WFFindSearchBarIn(vc.view, 0) != nil;
+    BOOL clsSelect = [cls containsString:@"Select"] || [cls containsString:@"Choose"] ||
+                     [cls containsString:@"Picker"];
+
+    BOOL isStrict = titleSelect || (clsSelect && (hasDone || hasSearch));
+    BOOL isFallback = (hasDone && hasSearch && rows >= 3);
+
+    // 同一「类名+文字」只判定记录一次，否则每 1.5 秒刷一行
+    static NSMutableSet *judged = nil;
+    static dispatch_once_t jOnce;
+    dispatch_once(&jOnce, ^{ judged = [NSMutableSet set]; });
+    NSString *jkey = [NSString stringWithFormat:@"%@|%@", cls, [texts componentsJoinedByString:@"/"]];
+    if (![judged containsObject:jkey]) {
+        [judged addObject:jkey];
+        WFLOG(@"[判定] %@ | 分区=%ld 首区行数=%ld | 文字=[%@] | 搜索框=%@ | 选中类名=%@ | 严格=%@ 兜底=%@",
+              cls, (long)sections, (long)rows, [texts componentsJoinedByString:@" / "],
+              hasSearch ? @"有" : @"无", clsSelect ? @"是" : @"否",
+              isStrict ? @"是" : @"否", isFallback ? @"是" : @"否");
+    }
+
+    if (!isStrict && !isFallback) return NO;
     if (strict) *strict = isStrict;
     return YES;
+}
+
+- (NSString *)pageDisplayName:(UIViewController *)vc {
+    if (!vc) return @"?";
+    NSArray<NSString *> *texts = WFPageTexts(vc);
+    NSString *best = @"";
+    for (NSString *t in texts) {
+        if ([t containsString:@"选择"] || [t containsString:@"折叠"] || [t containsString:@"群聊"]) {
+            best = t;
+            break;
+        }
+    }
+    if (!best.length && texts.count) best = texts.firstObject;
+    return best.length ? best : NSStringFromClass([vc class]);
 }
 
 - (void)scanTopPage {
     @try {
         UIViewController *vc = WFTopViewController();
-        if (!vc || vc == self.lastScannedVC) return;
-        self.lastScannedVC = vc;
+        if (!vc) return;
 
         self.lastVC = vc;
+
+        NSString *cls = NSStringFromClass([vc class]);
+        NSArray<NSString *> *texts = WFPageTextsCached(vc);
         UITableView *tv = WFFindTableViewIn(vc.view);
+        NSInteger sections = tv ? [tv numberOfSections] : -1;
+        NSInteger rows = (tv && sections > 0) ? [tv numberOfRowsInSection:0] : -1;
+        BOOL hasSearch = WFFindSearchBarIn(vc.view, 0) != nil;
+
+        // 页面记录：同一「类名+文字」只记一次，避免刷屏
+        static NSMutableSet *logged = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ logged = [NSMutableSet set]; });
+        NSString *key = [NSString stringWithFormat:@"%@|%@", cls, [texts componentsJoinedByString:@"/"]];
+        if (![logged containsObject:key]) {
+            [logged addObject:key];
+            WFLOG(@"[页面] %@ | 分区=%ld 首区行数=%ld | 文字=[%@] | 搜索框=%@ | 列表=%@",
+                  cls, (long)sections, (long)rows,
+                  [texts componentsJoinedByString:@" / "], hasSearch ? @"有" : @"无",
+                  tv ? @"有" : @"无");
+        }
+
         if (!tv) return;
 
-        NSString *title = vc.title.length ? vc.title : (vc.navigationItem.title ?: @"");
-        NSInteger rows = [tv numberOfSections] > 0 ? [tv numberOfRowsInSection:0] : 0;
-        NSString *rightTitle = vc.navigationItem.rightBarButtonItem.title ?: @"(无)";
-        WFLOG(@"[页面] %@ | 标题=%@ | 行数=%ld | 右上=%@",
-              NSStringFromClass([vc class]), title, (long)rows, rightTitle);
-
         BOOL strict = NO;
-        if (![self isSelectListPage:vc tableView:tv title:title strict:&strict]) return;
-        self.pickerIsStrict = strict;
-        self.pickerTable = tv;
-        WFLOG(@"[命中] 疑似「选择群聊」页：%@（标题=%@，%ld 行，%@匹配）",
-              NSStringFromClass([vc class]), title, (long)rows, strict ? @"严格" : @"宽松");
+        if (![self isSelectListPage:vc tableView:tv texts:texts isStrict:&strict]) return;
 
+        // 换了页面就重置「已全选」状态
+        if (![key isEqualToString:self.pickerPageKey ?: @""]) {
+            self.pickerPageKey = key;
+            self.selectAllDone = NO;
+            WFLOG(@"[命中] 多选页：%@（%@匹配，%ld 行）",
+                  cls, strict ? @"严格" : @"兜底", (long)rows);
+        }
+        self.pickerVC = vc;
+        self.pickerTable = tv;
+        self.pickerIsStrict = strict;
+
+        // 幂等注入：微信可能在我们之后重设导航栏，所以每次扫描都复查一遍
         UINavigationItem *item = vc.navigationItem;
+        if (!item) return;
         NSMutableArray<UIBarButtonItem *> *items = [NSMutableArray array];
         if (item.rightBarButtonItems.count) [items addObjectsFromArray:item.rightBarButtonItems];
         else if (item.rightBarButtonItem) [items addObject:item.rightBarButtonItem];
-        for (UIBarButtonItem *b in items) if ([b.title isEqualToString:@"全选"]) return;
 
-        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"全选"
-                                                                style:UIBarButtonItemStylePlain
-                                                               target:self
-                                                               action:@selector(onSelectAllTap)];
+        BOOL existed = NO;
+        for (UIBarButtonItem *b in items) {
+            if ([b.title hasPrefix:@"全选"] || [b.title hasPrefix:@"取消全选"]) { existed = YES; break; }
+        }
+        if (existed) return;
+
+        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:(self.selectAllDone ? @"取消全选" : @"全选")
+                                                               style:UIBarButtonItemStylePlain
+                                                              target:self
+                                                              action:@selector(onSelectAllTap)];
         [items insertObject:btn atIndex:0];
         item.rightBarButtonItems = items;
-        WFLOG(@"[注入] 已在 %@ 右上角加上「全选」", NSStringFromClass([vc class]));
+        WFLOG(@"[注入] 已在 %@ 右上角加上「全选」（原有右上按钮 %lu 个）",
+              cls, (unsigned long)(items.count - 1));
     } @catch (NSException *e) {
         WFLOG(@"页面扫描异常：%@", e.reason);
     }
 }
 
 - (void)onSelectAllTap {
-    UIViewController *vc = WFTopViewController();
-    UITableView *tv = vc ? WFFindTableViewIn(vc.view) : nil;
-    if (!tv) tv = self.pickerTable;
+    UIViewController *vc = self.pickerVC ?: WFTopViewController();
+    UITableView *tv = self.pickerTable ?: (vc ? WFFindTableViewIn(vc.view) : nil);
     if (!tv) { WFLOG(@"全选：找不到列表"); return; }
 
-    NSInteger total = 0;
-    for (NSInteger s = 0; s < [tv numberOfSections]; s++) total += [tv numberOfRowsInSection:s];
-    WFLOG(@"全选被点击：%ld 行，页面=%@，严格匹配=%@",
-          (long)total, vc ? NSStringFromClass([vc class]) : @"?", self.pickerIsStrict ? @"是" : @"否");
+    BOOL deselect = self.selectAllDone;
 
-    if (self.pickerIsStrict) {
-        [self performSelectAll:tv];
-        return;
-    }
-    // 宽松命中时先确认，避免在非选择页误操作
-    NSString *msg = [NSString stringWithFormat:@"当前页面：%@\n共 %ld 行。\n\n确认执行「全选」？",
-                     (vc.title.length ? vc.title : NSStringFromClass([vc class])), (long)total];
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"全选确认"
-                                                               message:msg
-                                                        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"执行全选" style:UIAlertActionStyleDestructive
-                                         handler:^(UIAlertAction *a) { [self performSelectAll:tv]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    UIViewController *host = vc ?: WFKeyWindow().rootViewController;
-    [host presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)performSelectAll:(UITableView *)tv {
-    id del = tv.delegate;
-    BOOL hasDidSelect = del && [del respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)];
-    WFLOG(@"全选开始：分区=%ld，delegate=%@，实现了didSelect=%@",
-          (long)[tv numberOfSections], del ? NSStringFromClass([del class]) : @"nil",
-          hasDidSelect ? @"是" : @"否");
-
-    NSInteger done = 0;
+    // 逐行判断是不是群聊，同时统计
+    NSMutableDictionary<NSNumber *, NSNumber *> *states = [NSMutableDictionary dictionary];
+    NSInteger total = 0, rooms = 0, others = 0, unknown = 0;
     for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
         NSInteger rows = [tv numberOfRowsInSection:s];
         for (NSInteger r = 0; r < rows; r++) {
+            NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:s];
+            NSInteger st = WFRowChatroomState(tv, ip);
+            states[@(s * 100000 + r)] = @(st);
+            total++;
+            if (st > 0) rooms++; else if (st == 0) others++; else unknown++;
+        }
+    }
+
+    // 一行都认不出群聊时，退回「全选所有行」，并在弹窗里如实告知
+    BOOL chatroomOnly = (rooms > 0);
+    WFLOG(@"全选被点击：共 %ld 行（群聊 %ld / 非群聊 %ld / 未知 %ld），页面=%@，模式=%@，动作=%@",
+          (long)total, (long)rooms, (long)others, (long)unknown,
+          vc ? NSStringFromClass([vc class]) : @"?", chatroomOnly ? @"只选群聊" : @"全选所有行",
+          deselect ? @"取消" : @"选中");
+
+    NSMutableString *msg = [NSMutableString string];
+    [msg appendFormat:@"页面：%@\n", [self pageDisplayName:vc]];
+    [msg appendFormat:@"共 %ld 行\n", (long)total];
+    [msg appendFormat:@"识别为群聊：%ld 行\n", (long)rooms];
+    if (others > 0) [msg appendFormat:@"非群聊（会跳过）：%ld 行\n", (long)others];
+    if (unknown > 0) [msg appendFormat:@"无法识别：%ld 行\n", (long)unknown];
+    [msg appendString:@"\n"];
+    if (!chatroomOnly) {
+        [msg appendString:@"⚠️ 一行都没认出是群聊，将勾选全部行。\n\n"];
+    }
+    [msg appendString:deselect ? @"确认取消全选？" : @"确认全选？"];
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:deselect ? @"取消全选" : @"全选确认"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:(deselect ? @"取消全选" : @"执行全选")
+                                           style:UIAlertActionStyleDestructive
+                                         handler:^(UIAlertAction *a) {
+        [self performSelectAll:tv deselect:deselect chatroomOnly:chatroomOnly states:states];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"返回" style:UIAlertActionStyleCancel handler:nil]];
+    UIViewController *host = vc ?: WFKeyWindow().rootViewController;
+    if (host) [host presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)performSelectAll:(UITableView *)tv
+                deselect:(BOOL)deselect
+             chatroomOnly:(BOOL)chatroomOnly
+                  states:(NSDictionary<NSNumber *, NSNumber *> *)states {
+    id del = tv.delegate;
+    BOOL hasDidSelect = del && [del respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)];
+    WFLOG(@"%@开始：分区=%ld，delegate=%@，实现了didSelect=%@",
+          deselect ? @"取消全选" : @"全选",
+          (long)[tv numberOfSections], del ? NSStringFromClass([del class]) : @"nil",
+          hasDidSelect ? @"是" : @"否");
+    if (!hasDidSelect) {
+        WFLOG(@"该页没有实现 didSelectRowAtIndexPath:，无法用逐行点击的方式处理");
+    }
+
+    NSInteger done = 0, skipped = 0, failed = 0;
+    for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
+        NSInteger rows = [tv numberOfRowsInSection:s];
+        for (NSInteger r = 0; r < rows; r++) {
+            NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:s];
+            NSNumber *stNum = states[@(s * 100000 + r)];
+            NSInteger st = stNum ? stNum.integerValue : -1;
+
             @try {
-                NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:s];
+                // 只选群聊模式下，已知不是群聊的行直接跳过
+                // （识别不出时 st=-1，照常处理，宁可多勾不漏勾）
+                if (chatroomOnly && st == 0) { skipped++; continue; }
                 // 行还没创建过就先滚到它，保证 cell 存在
                 if (![tv cellForRowAtIndexPath:ip]) {
                     [tv scrollToRowAtIndexPath:ip
                                  atScrollPosition:UITableViewScrollPositionMiddle
                                          animated:NO];
                 }
-                if (hasDidSelect && del) [del tableView:tv didSelectRowAtIndexPath:ip];
+                if (del) [del tableView:tv didSelectRowAtIndexPath:ip];
                 done++;
             } @catch (NSException *e) {
-                WFLOG(@"全选异常（分区%ld 第%ld 行）：%@", (long)s, (long)r, e.reason);
+                failed++;
+                WFLOG(@"行处理异常（分区%ld 第%ld 行）：%@", (long)s, (long)r, e.reason);
             }
         }
     }
-    WFLOG(@"全选完成：共处理 %ld 行", (long)done);
+
+    self.selectAllDone = !deselect;
+    // 按钮标题跟着状态走（再次点击就变成反向操作）
+    UIViewController *vc = self.pickerVC;
+    UINavigationItem *item = vc.navigationItem;
+    for (UIBarButtonItem *b in item.rightBarButtonItems) {
+        if ([b.title hasPrefix:@"全选"]) { b.title = @"取消全选"; break; }
+        if ([b.title hasPrefix:@"取消全选"]) { b.title = @"全选"; break; }
+    }
+
+    WFLOG(@"%@完成：处理 %ld 行，跳过 %ld 行（非群聊），失败 %ld 行",
+          deselect ? @"取消全选" : @"全选", (long)done, (long)skipped, (long)failed);
 }
 
 @end
