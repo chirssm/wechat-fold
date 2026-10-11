@@ -196,6 +196,98 @@ static id WFGetService(Class serviceClass) {
     return svc;
 }
 
+// 服务中心候选类名
+static NSArray<NSString *> *WFServiceCenterCandidates(void) {
+    return @[@"MMServiceCenter", @"WCServiceCenter", @"MMServiceCenterMgr", @"ServiceCenter"];
+}
+
+// 会话管理器候选类名
+static NSArray<NSString *> *WFSessionMgrCandidates(void) {
+    return @[@"MMSessionMgr", @"SessionMgr", @"WCSessionMgr",
+             @"MMSessionService", @"MMSessionManager", @"MMSessionMgrService",
+             @"WCConversationMgr", @"ConversationMgr"];
+}
+
+static id WFGetSessionMgr(void) {
+    WFLOG(@"---- 开始探测会话管理器 ----");
+    for (NSString *centerName in WFServiceCenterCandidates()) {
+        Class centerCls = NSClassFromString(centerName);
+        if (!centerCls) continue;
+        id center = WFCallNoArg(centerCls, @"defaultCenter");
+        if (!center) {
+            WFLOG(@"服务中心 %@ : 取不到 defaultCenter", centerName);
+            continue;
+        }
+        WFLOG(@"服务中心命中: %@", centerName);
+        for (NSString *mgrName in WFSessionMgrCandidates()) {
+            Class mgrCls = NSClassFromString(mgrName);
+            if (!mgrCls) continue;
+            BOOL ok = NO;
+            id svc = WFCallWithObject(center, @"getService:", mgrCls, &ok);
+            if (svc) {
+                WFLOG(@"会话管理器命中: %@ (via %@)", mgrName, centerName);
+                return svc;
+            }
+        }
+    }
+    WFLOG(@"会话管理器：全部候选均未命中");
+    return nil;
+}
+
+// 暴力枚举：把微信里所有跟会话/群聊/折叠相关的类、方法、ivar 全部写进日志
+static void WFEnumerateRelatedClasses(void) {
+    WFLOG(@"==== 开始枚举相关类 ====");
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) { WFLOG(@"无法获取类列表"); return; }
+    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)n);
+    n = objc_getClassList(classes, n);
+    int hit = 0;
+    for (int i = 0; i < n; i++) {
+        const char *cname = class_getName(classes[i]);
+        if (!cname) continue;
+        NSString *clsName = [NSString stringWithUTF8String:cname];
+        if (!([clsName containsString:@"Session"] ||
+              [clsName containsString:@"Chatroom"] ||
+              [clsName containsString:@"ChatRoom"] ||
+              [clsName containsString:@"Fold"] ||
+              [clsName containsString:@"Conversation"])) continue;
+
+        hit++;
+        if (hit > 120) { WFLOG(@"(类过多，截断)"); break; }
+        WFLOG(@"[类] %@", clsName);
+
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(classes[i], &mc);
+        int mShown = 0;
+        for (unsigned int j = 0; j < mc && mShown < 25; j++) {
+            NSString *mn = NSStringFromSelector(method_getName(ms[j]));
+            if ([mn containsString:@"Session"] || [mn containsString:@"Fold"] ||
+                [mn containsString:@"All"]   || [mn containsString:@"List"] ||
+                [mn containsString:@"Chatroom"] || [mn containsString:@"ChatRoom"]) {
+                WFLOG(@"    -%@", mn);
+                mShown++;
+            }
+        }
+        free(ms);
+
+        unsigned int ic = 0;
+        Ivar *ivs = class_copyIvarList(classes[i], &ic);
+        int iShown = 0;
+        for (unsigned int j = 0; j < ic && iShown < 15; j++) {
+            const char *iname = ivar_getName(ivs[j]);
+            if (!iname) continue;
+            NSString *iv = [NSString stringWithUTF8String:iname];
+            if ([iv containsString:@"ession"] || [iv containsString:@"old"] || [iv containsString:@"rrSession"]) {
+                WFLOG(@"    ivar %@ (%s)", iv, ivar_getTypeEncoding(ivs[j]) ?: "?");
+                iShown++;
+            }
+        }
+        free(ivs);
+    }
+    free(classes);
+    WFLOG(@"==== 枚举结束，命中 %d 个类 ====", hit);
+}
+
 static NSArray *WFAllSessions(id mgr) {
     for (NSString *selName in WFSessionListSelectors()) {
         id r = WFCallNoArg(mgr, selName);
@@ -312,7 +404,7 @@ static BOOL WFApplyFoldToSession(id session, BOOL fold) {
 }
 
 static NSInteger WFRunFold(BOOL fold) {
-    id mgr = WFGetService(NSClassFromString(kWFSessionMgrClass));
+    id mgr = WFGetSessionMgr();
     if (!mgr) return -1;
     NSArray *sessions = WFAllSessions(mgr);
     if (!sessions) {
@@ -522,11 +614,13 @@ static void WFNoteHook(NSString *clsName, NSString *role, BOOL ok) {
     UIAlertAction *dump = [UIAlertAction actionWithTitle:@"输出诊断信息"
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
-        id mgr = WFGetService(NSClassFromString(kWFSessionMgrClass));
-        WFDumpObject(mgr, @"MMSessionMgr");
+        WFLOG(@"==== 用户触发诊断 ====");
+        WFEnumerateRelatedClasses();
+        id mgr = WFGetSessionMgr();
+        WFDumpObject(mgr, @"SessionMgr");
         NSArray *s = WFAllSessions(mgr);
         if (s.count) WFDumpObject(s.firstObject, @"Session[0]");
-        [self alert:@"诊断信息已写入日志，点「查看日志」可以看到。" from:vc];
+        [self alert:@"诊断已写入日志。点「查看日志」→「复制全部」，粘贴发给我。" from:vc];
     }];
     UIAlertAction *viewLog = [UIAlertAction actionWithTitle:@"查看日志"
                                                      style:UIAlertActionStyleDefault
@@ -578,8 +672,10 @@ static void WFNoteHook(NSString *clsName, NSString *role, BOOL ok) {
     [s appendString:@"插件已加载。状态如下：\n\n"];
     [s appendFormat:@"%@", gWFHookReport ?: @"(hook 未执行)\n"];
     [s appendString:@"\n"];
-    id mgr = WFGetService(NSClassFromString(kWFSessionMgrClass));
-    [s appendFormat:@"会话管理器：%@\n", mgr ? @"已找到" : @"未找到"];
+    [s appendFormat:@"MMServiceCenter 类：%@\n", NSClassFromString(@"MMServiceCenter") ? @"存在" : @"不存在"];
+    [s appendFormat:@"MMSessionMgr 类：%@\n", NSClassFromString(@"MMSessionMgr") ? @"存在" : @"不存在"];
+    id mgr = WFGetSessionMgr();
+    [s appendFormat:@"会话管理器实例：%@\n", mgr ? @"已获取" : @"未获取"];
     if (mgr) {
         NSArray *ss = WFAllSessions(mgr);
         [s appendFormat:@"会话数量：%@\n", ss ? [NSString stringWithFormat:@"%lu", (unsigned long)ss.count] : @"取不到列表"];
