@@ -292,6 +292,10 @@ static void WFDumpObject(id obj, NSString *tag) {
 
 #pragma mark - 业务：执行折叠 / 展开
 
+static NSInteger gWFTotalSessions = 0;
+static NSInteger gWFChatrooms     = 0;
+static NSInteger gWFSuccess       = 0;
+
 static BOOL WFApplyFoldToSession(id session, BOOL fold) {
     // 路线 A：KVC 直接写属性
     for (NSString *key in WFFoldKeys()) {
@@ -332,6 +336,9 @@ static NSInteger WFRunFold(BOOL fold) {
 
     NSInteger success = 0, total = 0;
     BOOL dumped = NO;
+    gWFTotalSessions = (NSInteger)sessions.count;
+    gWFChatrooms = 0;
+    gWFSuccess = 0;
 
     for (id session in sessions) {
         if (!WFIsChatroomSession(session)) continue;
@@ -348,7 +355,10 @@ static NSInteger WFRunFold(BOOL fold) {
         }
     }
 
-    WFLOG(@"%@ 群聊 %ld/%ld 条", fold ? @"折叠" : @"展开", (long)success, (long)total);
+    gWFChatrooms = total;
+    gWFSuccess = success;
+    WFLOG(@"%@ 群聊：成功 %ld / 群聊总数 %ld / 会话总数 %ld",
+          fold ? @"折叠" : @"展开", (long)success, (long)total, (long)sessions.count);
 
     // 刷新 UI
     for (NSString *selName in WFReloadSelectors()) {
@@ -372,6 +382,9 @@ static NSInteger WFRunFold(BOOL fold) {
 @property (nonatomic, weak) UIView *hostView;
 + (instancetype)shared;
 - (void)attachTo:(UIView *)view;
+- (void)showLogFrom:(UIViewController *)vc;
+- (void)copyLogToPasteboard;
+- (void)closeLog;
 @end
 
 @implementation WFManager
@@ -440,12 +453,16 @@ static NSInteger WFRunFold(BOOL fold) {
         if (s.count) WFDumpObject(s.firstObject, @"Session[0]");
         [self alert:@"已写入日志" from:vc];
     }];
+    UIAlertAction *viewLog = [UIAlertAction actionWithTitle:@"查看日志"
+                                                     style:UIAlertActionStyleDefault
+                                                   handler:^(UIAlertAction *a) { [self showLogFrom:vc]; }];
     UIAlertAction *hide = [UIAlertAction actionWithTitle:@"隐藏按钮（本次运行）"
                                                    style:UIAlertActionStyleDestructive
                                                  handler:^(UIAlertAction *a) { self.button.hidden = YES; }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
 
-    [ac addAction:fold]; [ac addAction:unfold]; [ac addAction:dump]; [ac addAction:hide]; [ac addAction:cancel];
+    [ac addAction:fold]; [ac addAction:unfold]; [ac addAction:dump];
+    [ac addAction:viewLog]; [ac addAction:hide]; [ac addAction:cancel];
 
     if (ac.popoverPresentationController) {
         ac.popoverPresentationController.sourceView = self.button;
@@ -457,12 +474,84 @@ static NSInteger WFRunFold(BOOL fold) {
 - (void)run:(BOOL)fold from:(UIViewController *)vc {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSInteger n = WFRunFold(fold);
+        NSInteger totalSessions = gWFTotalSessions;
+        NSInteger chatrooms = gWFChatrooms;
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *msg = (n < 0) ? @"失败：未定位到会话列表，请查看日志"
-                                    : [NSString stringWithFormat:@"成功处理 %ld 个群聊", (long)n];
+            NSString *msg;
+            if (n < 0) {
+                msg = @"失败：没找到会话列表。\n\n说明 MMSessionMgr 这个类或它的方法名对不上你的微信版本。\n\n点菜单里的「查看日志」，把日志发给我。";
+            } else if (totalSessions == 0) {
+                msg = @"失败：会话列表是空的。\n\n说明拿到了管理器但列表方法名不对。\n\n点「查看日志」把日志发给我。";
+            } else if (chatrooms == 0) {
+                msg = [NSString stringWithFormat:@"拿到了 %ld 条会话，但一条群聊都没认出来。\n\n说明群聊判断条件（@chatroom 后缀）没匹配上。\n\n点「查看日志」把日志发给我。", (long)totalSessions];
+            } else if (n == 0) {
+                msg = [NSString stringWithFormat:@"认出 %ld 个群聊，但一个都没折叠成功。\n\n说明「折叠」相关的属性/方法名没命中。\n\n点「查看日志」，日志里会有 dump 出的真实属性名，发给我。", (long)chatrooms];
+            } else {
+                msg = [NSString stringWithFormat:@"成功 %ld 个，共识别 %ld 个群聊（会话总数 %ld）。", (long)n, (long)chatrooms, (long)totalSessions];
+            }
             [self alert:msg from:vc];
         });
     });
+}
+
+- (NSString *)logFilePath {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return dir ? [dir stringByAppendingPathComponent:@"WeChatFold.log"] : nil;
+}
+
+- (void)showLogFrom:(UIViewController *)vc {
+    NSString *log = [NSString stringWithContentsOfFile:[self logFilePath]
+                                             encoding:NSUTF8StringEncoding
+                                                error:nil];
+    if (!log || log.length == 0) {
+        log = @"(暂无日志)\n\n先点「输出诊断信息」或执行一次折叠，再回来看这里。";
+    }
+    if (log.length > 30000) {
+        log = [log substringFromIndex:log.length - 30000];
+    }
+
+    UIViewController *logVC = [[UIViewController alloc] init];
+    logVC.title = @"WeChatFold 日志";
+    logVC.view.backgroundColor = [UIColor whiteColor];
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:logVC.view.bounds];
+    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tv.text = log;
+    tv.font = [UIFont systemFontOfSize:11];
+    tv.editable = NO;
+    tv.backgroundColor = [UIColor whiteColor];
+    tv.textColor = [UIColor blackColor];
+    [logVC.view addSubview:tv];
+
+    logVC.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"复制全部"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(copyLogToPasteboard)];
+    logVC.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                         style:UIBarButtonItemStyleDone
+                                        target:self
+                                        action:@selector(closeLog)];
+
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:logVC];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [vc presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)copyLogToPasteboard {
+    NSString *log = [NSString stringWithContentsOfFile:[self logFilePath]
+                                             encoding:NSUTF8StringEncoding
+                                                error:nil];
+    if (log) {
+        [UIPasteboard generalPasteboard].string = log;
+        WFLOG(@"日志已复制到剪贴板（%lu 字符）", (unsigned long)log.length);
+    }
+}
+
+- (void)closeLog {
+    UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+    [root dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (void)alert:(NSString *)msg from:(UIViewController *)vc {
