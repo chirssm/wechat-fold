@@ -1,6 +1,11 @@
 //
-//  WeChatFold.m  v5
+//  WeChatFold.m  v6
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
+//
+//  v6 变更：
+//  1. 全局版本号 kWFVersion：写进日志首行、启动弹窗标题、设置页入口标题。
+//     装没装上，看一眼就知道，不用再猜。
+//  2. 换版本时自动恢复启动弹窗（清掉「不再自动提示」的开关）。
 //
 //  v5 变更：
 //  1. 移除悬浮按钮（不再有任何悬浮窗 UI）。
@@ -23,6 +28,9 @@
 #pragma mark - 可配置区
 
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
+
+// 版本号：日志、启动弹窗、设置页入口都会显示，用来确认新 dylib 是否真的装上
+static NSString * const kWFVersion = @"v6";
 
 // 设置页候选类名（只在这里注入入口）
 static NSArray<NSString *> *WFSettingCandidates(void) {
@@ -734,7 +742,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         [entry addSubview:line];
 
         UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(20, 8, w - 60, 40)];
-        lb.text = @"群聊批量折叠";
+        lb.text = [NSString stringWithFormat:@"群聊批量折叠 %@", kWFVersion];
         lb.font = [UIFont systemFontOfSize:16];
         lb.textColor = fg;
         [entry addSubview:lb];
@@ -752,7 +760,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 
         self.lastSettingVC = vc;
         tv.tableFooterView = entry;
-        WFLOG(@"设置页入口已注入：%@", NSStringFromClass([vc class]));
+        WFLOG(@"设置页入口已注入 %@：%@", kWFVersion, NSStringFromClass([vc class]));
     } @catch (NSException *e) {
         WFLOG(@"设置页入口注入失败：%@", e.reason);
     }
@@ -885,7 +893,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     if (!vc) return;
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"WFBootAlertDisabled"]) return;
 
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"WeChatFold v5"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"WeChatFold %@", kWFVersion]
                                                                message:[self statusReport]
                                                         preferredStyle:UIAlertControllerStyleAlert];
 
@@ -901,7 +909,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
 
     [vc presentViewController:ac animated:YES completion:nil];
-    WFLOG(@"启动自检弹窗已显示");
+    WFLOG(@"启动自检弹窗已显示 %@", kWFVersion);
 }
 
 #pragma mark 日志查看器
@@ -1041,7 +1049,19 @@ static void WFTryBootAlert(int attempt) {
 
 __attribute__((constructor))
 static void WFEntry(void) {
-    WFLOG(@"=== WeChatFold dylib 已加载 v5 (pid=%d) ===", getpid());
+    // 换版本时自动恢复启动弹窗，方便确认新 dylib 是否真的装载
+    @try {
+        NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"WFSilentVersion"];
+        if (!saved || ![saved isEqualToString:kWFVersion]) {
+            [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"WFBootAlertDisabled"];
+            [[NSUserDefaults standardUserDefaults] setObject:kWFVersion forKey:@"WFSilentVersion"];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+    } @catch (NSException *e) { }
+
+    WFLOG(@"#############################");
+    WFLOG(@"### WeChatFold %@ 已加载 (pid=%d) ###", kWFVersion, getpid());
+    WFLOG(@"#############################");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try { WFInstallHooks(); }
         @catch (NSException *e) { WFLOG(@"安装 hook 失败：%@", e.reason); }
