@@ -1,6 +1,13 @@
 //
-//  WeChatFold.m  v6
+//  WeChatFold.m  v7
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
+//
+//  v7 变更：
+//  1. 新增「诊断4：折叠机制+插件环境」：
+//     - 列出 App 包内所有第三方 dylib（可直接看到 Mikoto / 微信助手 等同类插件）
+//     - 扫描微信自身的折叠机制类（ChatFoldViewModel / ChatFoldCellView 等），
+//       目标是改用官方「折叠的群聊」API，而不是靠猜属性名。
+//  2. 启动弹窗增加「同装插件」一行，冲突风险一眼可见。
 //
 //  v6 变更：
 //  1. 全局版本号 kWFVersion：写进日志首行、启动弹窗标题、设置页入口标题。
@@ -24,13 +31,14 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
 
 #pragma mark - 可配置区
 
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
 
 // 版本号：日志、启动弹窗、设置页入口都会显示，用来确认新 dylib 是否真的装上
-static NSString * const kWFVersion = @"v6";
+static NSString * const kWFVersion = @"v7";
 
 // 设置页候选类名（只在这里注入入口）
 static NSArray<NSString *> *WFSettingCandidates(void) {
@@ -520,6 +528,93 @@ static NSArray *WFSessionsFromUI(void) {
     return best;
 }
 
+#pragma mark - 诊断 4：折叠机制 + 插件环境
+
+// 列出 App 包内加载的第三方 dylib（用来发现 Mikoto / 助手 等同类插件）
+static NSArray<NSString *> *WFOtherInjectedDylibs(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *cname = _dyld_get_image_name(i);
+        if (!cname) continue;
+        NSString *p = [NSString stringWithUTF8String:cname];
+        if (!p.length) continue;
+        if ([p hasPrefix:@"/System/"] || [p hasPrefix:@"/usr/lib/"] || [p hasPrefix:@"/Developer/"]) continue;
+        if (![p containsString:@"/Application/"]) continue;   // 只看 App 包内的
+        if (![p hasSuffix:@".dylib"]) continue;
+        NSString *shortName = [p lastPathComponent];
+        if ([shortName hasPrefix:@"lib"]) continue;
+        if ([shortName isEqualToString:@"WeChatFold.dylib"]) continue;
+        if (![out containsObject:shortName]) [out addObject:shortName];
+    }
+    return out;
+}
+
+static void WFListInjectedDylibs(void) {
+    WFLOG(@"==== 已注入的插件 dylib（App 包内）====");
+    NSArray<NSString *> *list = WFOtherInjectedDylibs();
+    if (list.count == 0) {
+        WFLOG(@"  仅本插件，没有发现其它第三方 dylib");
+    } else {
+        WFLOG(@"  共 %lu 个：", (unsigned long)list.count);
+        for (NSString *s in list) WFLOG(@"    %@", s);
+    }
+    WFLOG(@"==== 插件列表结束 ====");
+}
+
+// 微信命名域前缀
+static NSArray<NSString *> *WFNamespacePrefixes(void) {
+    return @[@"MM", @"WC", @"WX", @"New", @"Chat", @"Base", @"Enterprise",
+             @"Brand", @"Friend", @"Session", @"CContact", @"Contact", @"Converge"];
+}
+
+// 扫描微信自身的「折叠」机制（官方折叠的群聊 = ChatFoldViewModel / ChatFoldCellView）
+static void WFDumpFoldClasses(void) {
+    WFLOG(@"==== 折叠机制扫描 ====");
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) { WFLOG(@"无法获取类列表"); return; }
+    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)n);
+    n = objc_getClassList(classes, n);
+
+    NSMutableArray<NSString *> *targets = [NSMutableArray array];
+    for (int i = 0; i < n; i++) {
+        const char *cname = class_getName(classes[i]);
+        if (!cname) continue;
+        NSString *name = [NSString stringWithUTF8String:cname];
+        if (WFIsSwiftClassName(name)) continue;
+        NSString *low = [name lowercaseString];
+        if (![low containsString:@"fold"]) continue;
+        for (NSString *p in WFNamespacePrefixes()) {
+            if ([name hasPrefix:p]) { [targets addObject:name]; break; }
+        }
+    }
+    free(classes);
+
+    [targets sortUsingSelector:@selector(compare:)];
+    WFLOG(@"微信域内含 Fold 的类：%lu 个", (unsigned long)targets.count);
+    for (NSString *name in targets) WFLOG(@"[Fold] %@", name);
+
+    WFLOG(@"---- 详情 ----");
+    for (NSString *name in targets) {
+        Class cls = NSClassFromString(name);
+        if (!cls) continue;
+        WFLOG(@"[类] %@  父类=%@", name, NSStringFromClass(class_getSuperclass(cls)));
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(cls, &mc);
+        for (unsigned int j = 0; j < mc && j < 70; j++) {
+            WFLOG(@"    %@", NSStringFromSelector(method_getName(ms[j])));
+        }
+        free(ms);
+        unsigned int ic = 0;
+        Ivar *ivs = class_copyIvarList(cls, &ic);
+        for (unsigned int j = 0; j < ic && j < 30; j++) {
+            WFLOG(@"    ivar %s (%s)", ivar_getName(ivs[j]) ?: "?", ivar_getTypeEncoding(ivs[j]) ?: "?");
+        }
+        free(ivs);
+    }
+    WFLOG(@"==== 折叠机制扫描结束 ====");
+}
+
 #pragma mark - 会话定位
 
 static NSArray<NSString *> *WFSessionMgrCandidates(void) {
@@ -809,6 +904,14 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         WFEnumerateSessionClasses();
         [self alert:@"已枚举会话相关类。点「查看日志」→「复制全部」发给我。" from:vc];
     }];
+    UIAlertAction *diag4 = [UIAlertAction actionWithTitle:@"诊断4：折叠机制+插件环境"
+                                                    style:UIAlertActionStyleDefault
+                                                  handler:^(UIAlertAction *a) {
+        WFLOG(@"==== 用户触发：折叠机制+插件环境 ====");
+        WFListInjectedDylibs();
+        WFDumpFoldClasses();
+        [self alert:@"已扫描折叠机制与插件环境。点「查看日志」→「复制全部」发给我。" from:vc];
+    }];
     UIAlertAction *viewLog = [UIAlertAction actionWithTitle:@"查看日志"
                                                      style:UIAlertActionStyleDefault
                                                    handler:^(UIAlertAction *a) { [self showLogFrom:vc]; }];
@@ -818,7 +921,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
 
     [ac addAction:fold]; [ac addAction:unfold];
-    [ac addAction:diag1]; [ac addAction:diag2]; [ac addAction:diag3];
+    [ac addAction:diag1]; [ac addAction:diag2]; [ac addAction:diag3]; [ac addAction:diag4];
     [ac addAction:viewLog]; [ac addAction:clear]; [ac addAction:cancel];
 
     if (ac.popoverPresentationController) {
@@ -885,6 +988,9 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         NSArray *ss = WFAllSessions(mgr);
         [s appendFormat:@"会话数量：%@\n", ss ? [NSString stringWithFormat:@"%lu", (unsigned long)ss.count] : @"取不到列表"];
     }
+    NSArray<NSString *> *others = WFOtherInjectedDylibs();
+    [s appendFormat:@"\n同装插件：\n%@\n",
+        others.count ? [others componentsJoinedByString:@"\n"] : @"（仅本插件）"];
     [s appendString:@"\n入口位置：微信 → 我 → 设置 → 页面最底部"];
     return s;
 }
