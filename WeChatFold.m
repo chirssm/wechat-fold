@@ -185,14 +185,11 @@ static BOOL WFCallWithBool(id target, NSString *selName, BOOL arg) {
 
 #pragma mark - 会话定位
 
-static id WFGetService(Class serviceClass) {
-    id center = WFCallNoArg(NSClassFromString(@"MMServiceCenter"), @"defaultCenter");
-    if (!center) { WFLOG(@"MMServiceCenter 未找到"); return nil; }
-    if (!serviceClass) return nil;
+static id WFGetServiceFrom(id center, Class serviceClass) {
+    if (!center || !serviceClass) return nil;
     BOOL ok = NO;
     id svc = WFCallWithObject(center, @"getService:", serviceClass, &ok);
     if (!ok) svc = WFCallWithObject(center, @"getService:", NSStringFromClass(serviceClass), &ok);
-    if (!svc) WFLOG(@"getService:%@ 失败", NSStringFromClass(serviceClass));
     return svc;
 }
 
@@ -209,7 +206,7 @@ static NSArray<NSString *> *WFSessionMgrCandidates(void) {
 }
 
 static id WFGetSessionMgr(void) {
-    WFLOG(@"---- 开始探测会话管理器 ----");
+    WFLOG(@"---- 开始探测会话管理器（首选 %@）----", kWFSessionMgrClass);
     for (NSString *centerName in WFServiceCenterCandidates()) {
         Class centerCls = NSClassFromString(centerName);
         if (!centerCls) continue;
@@ -222,8 +219,7 @@ static id WFGetSessionMgr(void) {
         for (NSString *mgrName in WFSessionMgrCandidates()) {
             Class mgrCls = NSClassFromString(mgrName);
             if (!mgrCls) continue;
-            BOOL ok = NO;
-            id svc = WFCallWithObject(center, @"getService:", mgrCls, &ok);
+            id svc = WFGetServiceFrom(center, mgrCls);
             if (svc) {
                 WFLOG(@"会话管理器命中: %@ (via %@)", mgrName, centerName);
                 return svc;
