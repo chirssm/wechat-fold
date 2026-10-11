@@ -1,6 +1,16 @@
 //
-//  WeChatFold.m  v7
+//  WeChatFold.m  v8
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
+//
+//  v8 变更（换思路：复用微信官方折叠机制，不碰内部 API）：
+//  1. 新增「页面扫描」：每 1.5 秒检查当前最顶层页面，若不是已知页面则记录
+//     类名/标题/行数（写进日志，用于定位真实类名）。
+//  2. 识别「选择群聊」多选页（标题含"选择"为严格命中；含"添加/群聊"或类名含
+//     Select 为宽松命中），自动在右上角追加「全选」按钮，不动原有的「完成」。
+//  3. 「全选」= 逐行调用 tableView 的 didSelectRowAtIndexPath:，
+//     复用微信自己的勾选逻辑，不改任何数据。
+//  4. 严格命中的页面直接执行；宽松命中的页面先弹确认框，防误操作。
+//  5. 黑名单保护：聊天窗口/主界面/设置/搜索等页面一律不注入。
 //
 //  v7 变更：
 //  1. 新增「诊断4：折叠机制+插件环境」：
@@ -38,7 +48,7 @@
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
 
 // 版本号：日志、启动弹窗、设置页入口都会显示，用来确认新 dylib 是否真的装上
-static NSString * const kWFVersion = @"v7";
+static NSString * const kWFVersion = @"v8";
 
 // 设置页候选类名（只在这里注入入口）
 static NSArray<NSString *> *WFSettingCandidates(void) {
@@ -228,6 +238,27 @@ static UITableView *WFFindTableViewIn(UIView *root) {
         if (t) return t;
     }
     return nil;
+}
+
+// 找到当前最顶层的可见控制器（穿透 present / nav / tab）
+static UIViewController *WFDeepestVC(UIViewController *vc, int depth) {
+    if (!vc || depth > 8) return vc;
+    if (vc.presentedViewController) return WFDeepestVC(vc.presentedViewController, depth + 1);
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        UIViewController *top = ((UINavigationController *)vc).topViewController;
+        if (top && top != vc) return WFDeepestVC(top, depth + 1);
+    }
+    if ([vc isKindOfClass:[UITabBarController class]]) {
+        UIViewController *sel = ((UITabBarController *)vc).selectedViewController;
+        if (sel && sel != vc) return WFDeepestVC(sel, depth + 1);
+    }
+    return vc;
+}
+
+static UIViewController *WFTopViewController(void) {
+    UIWindow *w = WFKeyWindow();
+    if (!w) return nil;
+    return WFDeepestVC(w.rootViewController, 0);
 }
 
 #pragma mark - 对象 dump
@@ -781,6 +812,9 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 @interface WFManager : NSObject
 @property (nonatomic, weak) UIViewController *lastVC;
 @property (nonatomic, weak) UIViewController *lastSettingVC;
+@property (nonatomic, weak) UIViewController *lastScannedVC;
+@property (nonatomic, weak) UITableView *pickerTable;
+@property (nonatomic, assign) BOOL pickerIsStrict;
 + (instancetype)shared;
 - (void)injectSettingEntry:(UIViewController *)vc;
 - (void)showMenuFrom:(UIViewController *)vc;
@@ -789,6 +823,9 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 - (void)copyLogToPasteboard;
 - (void)closeLog;
 - (void)alert:(NSString *)msg from:(UIViewController *)vc;
+- (void)scanTopPage;
+- (void)onSelectAllTap;
+- (void)performSelectAll:(UITableView *)tv;
 @end
 
 @implementation WFManager
@@ -1078,6 +1115,129 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     [vc presentViewController:ac animated:YES completion:nil];
 }
 
+#pragma mark 页面扫描（给「选择群聊」页挂「全选」）
+
+// 判断是不是「选择群聊」这类多选页面
+- (BOOL)isSelectListPage:(UIViewController *)vc tableView:(UITableView *)tv title:(NSString *)title strict:(BOOL *)strict {
+    if (!vc.navigationController) return NO;
+    NSString *cls = NSStringFromClass([vc class]);
+    // 黑名单：聊天窗口、主界面、设置、搜索等，绝对不碰
+    NSArray<NSString *> *black = @[@"MsgContent", @"Message", @"Msg", @"Content",
+                                   @"MainFrame", @"MainViewController", @"TabBar",
+                                   @"Setting", @"Search", @"Contact", @"Moment",
+                                   @"Timeline", @"Profile", @"Login"];
+    for (NSString *b in black) if ([cls containsString:b]) return NO;
+
+    NSInteger rows = [tv numberOfSections] > 0 ? [tv numberOfRowsInSection:0] : 0;
+    if (rows < 2) return NO;
+
+    BOOL isStrict = [title containsString:@"选择"];
+    BOOL isLoose  = [title containsString:@"添加"] || [title containsString:@"群聊"] ||
+                    ([title containsString:@"折叠"] && [cls containsString:@"Select"]) ||
+                    [cls containsString:@"Select"];
+    if (!isStrict && !isLoose) return NO;
+    if (strict) *strict = isStrict;
+    return YES;
+}
+
+- (void)scanTopPage {
+    @try {
+        UIViewController *vc = WFTopViewController();
+        if (!vc || vc == self.lastScannedVC) return;
+        self.lastScannedVC = vc;
+
+        self.lastVC = vc;
+        UITableView *tv = WFFindTableViewIn(vc.view);
+        if (!tv) return;
+
+        NSString *title = vc.title.length ? vc.title : (vc.navigationItem.title ?: @"");
+        NSInteger rows = [tv numberOfSections] > 0 ? [tv numberOfRowsInSection:0] : 0;
+        NSString *rightTitle = vc.navigationItem.rightBarButtonItem.title ?: @"(无)";
+        WFLOG(@"[页面] %@ | 标题=%@ | 行数=%ld | 右上=%@",
+              NSStringFromClass([vc class]), title, (long)rows, rightTitle);
+
+        BOOL strict = NO;
+        if (![self isSelectListPage:vc tableView:tv title:title strict:&strict]) return;
+        self.pickerIsStrict = strict;
+        self.pickerTable = tv;
+        WFLOG(@"[命中] 疑似「选择群聊」页：%@（标题=%@，%ld 行，%@匹配）",
+              NSStringFromClass([vc class]), title, (long)rows, strict ? @"严格" : @"宽松");
+
+        UINavigationItem *item = vc.navigationItem;
+        NSMutableArray<UIBarButtonItem *> *items = [NSMutableArray array];
+        if (item.rightBarButtonItems.count) [items addObjectsFromArray:item.rightBarButtonItems];
+        else if (item.rightBarButtonItem) [items addObject:item.rightBarButtonItem];
+        for (UIBarButtonItem *b in items) if ([b.title isEqualToString:@"全选"]) return;
+
+        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"全选"
+                                                                style:UIBarButtonItemStylePlain
+                                                               target:self
+                                                               action:@selector(onSelectAllTap)];
+        [items insertObject:btn atIndex:0];
+        item.rightBarButtonItems = items;
+        WFLOG(@"[注入] 已在 %@ 右上角加上「全选」", NSStringFromClass([vc class]));
+    } @catch (NSException *e) {
+        WFLOG(@"页面扫描异常：%@", e.reason);
+    }
+}
+
+- (void)onSelectAllTap {
+    UIViewController *vc = WFTopViewController();
+    UITableView *tv = vc ? WFFindTableViewIn(vc.view) : nil;
+    if (!tv) tv = self.pickerTable;
+    if (!tv) { WFLOG(@"全选：找不到列表"); return; }
+
+    NSInteger total = 0;
+    for (NSInteger s = 0; s < [tv numberOfSections]; s++) total += [tv numberOfRowsInSection:s];
+    WFLOG(@"全选被点击：%ld 行，页面=%@，严格匹配=%@",
+          (long)total, vc ? NSStringFromClass([vc class]) : @"?", self.pickerIsStrict ? @"是" : @"否");
+
+    if (self.pickerIsStrict) {
+        [self performSelectAll:tv];
+        return;
+    }
+    // 宽松命中时先确认，避免在非选择页误操作
+    NSString *msg = [NSString stringWithFormat:@"当前页面：%@\n共 %ld 行。\n\n确认执行「全选」？",
+                     (vc.title.length ? vc.title : NSStringFromClass([vc class])), (long)total];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"全选确认"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"执行全选" style:UIAlertActionStyleDestructive
+                                         handler:^(UIAlertAction *a) { [self performSelectAll:tv]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    UIViewController *host = vc ?: WFKeyWindow().rootViewController;
+    [host presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)performSelectAll:(UITableView *)tv {
+    id del = tv.delegate;
+    BOOL hasDidSelect = del && [del respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)];
+    WFLOG(@"全选开始：分区=%ld，delegate=%@，实现了didSelect=%@",
+          (long)[tv numberOfSections], del ? NSStringFromClass([del class]) : @"nil",
+          hasDidSelect ? @"是" : @"否");
+
+    NSInteger done = 0;
+    for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
+        NSInteger rows = [tv numberOfRowsInSection:s];
+        for (NSInteger r = 0; r < rows; r++) {
+            @try {
+                NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:s];
+                // 行还没创建过就先滚到它，保证 cell 存在
+                if (![tv cellForRowAtIndexPath:ip]) {
+                    [tv scrollToRowAtIndexPath:ip
+                                 atScrollPosition:UITableViewScrollPositionMiddle
+                                         animated:NO];
+                }
+                if (hasDidSelect && del) [del tableView:tv didSelectRowAtIndexPath:ip];
+                done++;
+            } @catch (NSException *e) {
+                WFLOG(@"全选异常（分区%ld 第%ld 行）：%@", (long)s, (long)r, e.reason);
+            }
+        }
+    }
+    WFLOG(@"全选完成：共处理 %ld 行", (long)done);
+}
+
 @end
 
 #pragma mark - Hook 安装
@@ -1153,6 +1313,8 @@ static void WFTryBootAlert(int attempt) {
 
 #pragma mark - 入口
 
+static void WFStartPageScanner(void);   // 前置声明（定义在本文件末尾）
+
 __attribute__((constructor))
 static void WFEntry(void) {
     // 换版本时自动恢复启动弹窗，方便确认新 dylib 是否真的装载
@@ -1171,6 +1333,26 @@ static void WFEntry(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try { WFInstallHooks(); }
         @catch (NSException *e) { WFLOG(@"安装 hook 失败：%@", e.reason); }
+        WFStartPageScanner();
         WFTryBootAlert(0);
     });
+}
+
+#pragma mark - 页面扫描定时器
+
+static dispatch_source_t gWFScanner = nil;
+
+static void WFStartPageScanner(void) {
+    if (gWFScanner) return;
+    gWFScanner = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (!gWFScanner) return;
+    dispatch_source_set_timer(gWFScanner,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                              (uint64_t)(1.5 * NSEC_PER_SEC),
+                              (uint64_t)(0.3 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(gWFScanner, ^{
+        [[WFManager shared] scanTopPage];
+    });
+    dispatch_resume(gWFScanner);
+    WFLOG(@"页面扫描已启动（每 1.5 秒）");
 }
