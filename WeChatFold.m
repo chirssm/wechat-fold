@@ -1,89 +1,89 @@
 //
-//  WeChatFold.m
+//  WeChatFold.m  v3
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
 //
-//  设计要点：
-//  1. 零依赖：不使用 CydiaSubstrate、不使用 Logos %hook。
-//     巨魔(TrollStore)环境没有 Substrate 运行时，dylib 必须自包含。
-//     这里用纯 Objective-C runtime (method_setImplementation / NSInvocation / KVC) 实现。
-//  2. 弱耦合：微信内部类与属性名随版本变化，采用「候选名探测」策略，
-//     运行时逐个试探，命中即用，并把命中的真实 API 名写进日志。
-//  3. 可诊断：所有探测结果同时写 NSLog 和 App 沙盒 Documents/WeChatFold.log，
-//     巨魔环境下可用 TrollStore 的文件访问 / Filza 取出查看。
+//  v3 变更：
+//  1. 启动即弹窗自检：dylib 一加载就主动弹窗报到，显示 hook 结果与会话探测结果，
+//     解决「按钮没出现就无法诊断」的死结。
+//  2. 微信设置页注入入口：在设置列表底部追加一行「群聊批量折叠」，
+//     通过 tableFooterView 实现，不动 dataSource，风险低。
+//  3. 多候选类名：主界面与设置页各有一串候选类名，命中哪个 hook 哪个。
 //
-//  仅供个人自用与学习研究，请勿用于任何违反微信用户协议或法律法规的用途。
+//  零依赖：不用 CydiaSubstrate / Logos %hook，纯 Objective-C runtime。
+//  仅供个人自用与学习研究。
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-#pragma mark - 可配置区：如你的微信版本对不上，改这里
+#pragma mark - 可配置区
 
-static NSString * const kWFMainFrameClass  = @"MainFrameViewController";
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
-static NSString * const kWFContactMgrClass = @"CContactMgr";
 
-// 拿到「全部会话列表」的候选方法名
-static NSArray<NSString *> *WFSessionListSelectors(void) {
-    return @[@"getAllSessions",
-             @"GetAllSession",
-             @"getSessionList",
-             @"getAllSessionInfo",
-             @"getSessions"];
+// 主界面候选类名
+static NSArray<NSString *> *WFMainFrameCandidates(void) {
+    return @[@"MainFrameViewController",
+             @"MMMainTabViewController",
+             @"MMMainViewController",
+             @"WMMainViewController",
+             @"MMTabBarController",
+             @"WMTabBarController"];
 }
 
-// 会话列表的候选属性名（当方法名都命中不了时，退化为 KVC 读取）
+// 设置页候选类名
+static NSArray<NSString *> *WFSettingCandidates(void) {
+    return @[@"NewSettingViewController",
+             @"WCSettingViewController",
+             @"MMSettingViewController",
+             @"MoreViewController",
+             @"MMMoreViewController",
+             @"WXSettingViewController",
+             @"SettingViewController"];
+}
+
+// 会话列表候选方法名
+static NSArray<NSString *> *WFSessionListSelectors(void) {
+    return @[@"getAllSessions", @"GetAllSession", @"getSessionList",
+             @"getAllSessionInfo", @"getSessions", @"GetSessionList"];
+}
+
+// 会话列表候选属性名
 static NSArray<NSString *> *WFSessionListKeys(void) {
     return @[@"m_arrSession", @"m_arrSessionInfo", @"m_sessionList", @"arrSession"];
 }
 
-// 「是否折叠」的候选属性名（KVC 写入）
+// 「是否折叠」候选属性名（KVC 写入）
 static NSArray<NSString *> *WFFoldKeys(void) {
-    return @[@"m_bIsFoldSession",
-             @"m_bFolded",
-             @"m_bIsFold",
-             @"m_bShowInFoldList",
-             @"m_uiFoldSessionFlag",
-             @"m_bFoldSession",
-             @"m_bInFoldSessionList"];
+    return @[@"m_bIsFoldSession", @"m_bFolded", @"m_bIsFold",
+             @"m_bShowInFoldList", @"m_uiFoldSessionFlag",
+             @"m_bFoldSession", @"m_bInFoldSessionList"];
 }
 
-// 「设置折叠」的候选方法名（带一个 BOOL 参数）
+// 「设置折叠」候选方法名（BOOL 参数）
 static NSArray<NSString *> *WFFoldSelectors(void) {
-    return @[@"setFoldSession:",
-             @"foldSession:",
-             @"updateSessionFoldStatus:",
-             @"setM_bIsFoldSession:",
-             @"setSessionFold:flag:",
-             @"markSessionAsFolded:"];
+    return @[@"setFoldSession:", @"foldSession:", @"updateSessionFoldStatus:",
+             @"setM_bIsFoldSession:", @"setSessionFold:flag:", @"markSessionAsFolded:"];
 }
 
-// 会话对象里「用户名」的候选属性名
 static NSArray<NSString *> *WFUserNameKeys(void) {
     return @[@"m_nsUserName", @"m_nsUsrName", @"m_nsFromUser", @"userName"];
 }
 
-// 会话对象里「联系人对象」的候选属性名
 static NSArray<NSString *> *WFContactKeys(void) {
     return @[@"m_contact", @"m_oContact", @"contact"];
 }
 
-// 保存会话变更的候选方法名
 static NSArray<NSString *> *WFSaveSelectors(void) {
     return @[@"UpdateSession:", @"updateSession:", @"saveSession:", @"ModifySession:", @"reloadSession"];
 }
 
-// 刷新会话列表 UI 的候选方法名
 static NSArray<NSString *> *WFReloadSelectors(void) {
-    return @[@"reloadData",
-             @"reloadSessionList",
-             @"refreshSessionList",
-             @"updateSessionList",
-             @"reloadTableView"];
+    return @[@"reloadData", @"reloadSessionList", @"refreshSessionList",
+             @"updateSessionList", @"reloadTableView"];
 }
 
-#pragma mark - 日志：同时输出 NSLog 与沙盒文件
+#pragma mark - 日志
 
 #define WFLOG(fmt, ...) WFLogMessage(([NSString stringWithFormat:(fmt), ##__VA_ARGS__]))
 
@@ -106,7 +106,7 @@ static void WFLogMessage(NSString *msg) {
     } @catch (NSException *e) { }
 }
 
-#pragma mark - 运行时小工具
+#pragma mark - 运行时工具
 
 static id WFValueForKey(id obj, NSString *key) {
     if (!obj || !key) return nil;
@@ -116,15 +116,10 @@ static id WFValueForKey(id obj, NSString *key) {
 
 static BOOL WFSetBoolForKey(id obj, NSString *key, BOOL value) {
     if (!obj || !key) return NO;
-    @try {
-        [obj setValue:@(value) forKey:key];
-        return YES;
-    } @catch (NSException *e) {
-        return NO;
-    }
+    @try { [obj setValue:@(value) forKey:key]; return YES; }
+    @catch (NSException *e) { return NO; }
 }
 
-// 无参调用，返回对象
 static id WFCallNoArg(id target, NSString *selName) {
     if (!target) return nil;
     SEL sel = NSSelectorFromString(selName);
@@ -145,7 +140,6 @@ static id WFCallNoArg(id target, NSString *selName) {
     return nil;
 }
 
-// 带一个对象参数调用，ok 表示是否成功发起调用
 static id WFCallWithObject(id target, NSString *selName, id arg, BOOL *ok) {
     if (ok) *ok = NO;
     if (!target) return nil;
@@ -172,7 +166,6 @@ static id WFCallWithObject(id target, NSString *selName, id arg, BOOL *ok) {
     return nil;
 }
 
-// 带一个 BOOL 参数调用，返回是否成功发起调用
 static BOOL WFCallWithBool(id target, NSString *selName, BOOL arg) {
     if (!target) return NO;
     SEL sel = NSSelectorFromString(selName);
@@ -190,18 +183,16 @@ static BOOL WFCallWithBool(id target, NSString *selName, BOOL arg) {
     @catch (NSException *e) { WFLOG(@"call -%@ failed: %@", selName, e.reason); return NO; }
 }
 
-#pragma mark - 业务：定位会话管理器 / 会话列表
+#pragma mark - 会话定位
 
 static id WFGetService(Class serviceClass) {
     id center = WFCallNoArg(NSClassFromString(@"MMServiceCenter"), @"defaultCenter");
-    if (!center) { WFLOG(@"MMServiceCenter not found"); return nil; }
-    if (!serviceClass) { WFLOG(@"service class nil"); return nil; }
+    if (!center) { WFLOG(@"MMServiceCenter 未找到"); return nil; }
+    if (!serviceClass) return nil;
     BOOL ok = NO;
     id svc = WFCallWithObject(center, @"getService:", serviceClass, &ok);
-    if (!ok) {
-        svc = WFCallWithObject(center, @"getService:", NSStringFromClass(serviceClass), &ok);
-    }
-    if (!svc) WFLOG(@"getService:%@ failed", NSStringFromClass(serviceClass));
+    if (!ok) svc = WFCallWithObject(center, @"getService:", NSStringFromClass(serviceClass), &ok);
+    if (!svc) WFLOG(@"getService:%@ 失败", NSStringFromClass(serviceClass));
     return svc;
 }
 
@@ -209,18 +200,18 @@ static NSArray *WFAllSessions(id mgr) {
     for (NSString *selName in WFSessionListSelectors()) {
         id r = WFCallNoArg(mgr, selName);
         if ([r isKindOfClass:[NSArray class]]) {
-            WFLOG(@"session list hit selector: -%@ (%lu items)", selName, (unsigned long)[r count]);
+            WFLOG(@"会话列表命中方法 -%@（%lu 条）", selName, (unsigned long)[r count]);
             return r;
         }
     }
     for (NSString *key in WFSessionListKeys()) {
         id r = WFValueForKey(mgr, key);
         if ([r isKindOfClass:[NSArray class]]) {
-            WFLOG(@"session list hit key: %@ (%lu items)", key, (unsigned long)[r count]);
+            WFLOG(@"会话列表命中属性 %@（%lu 条）", key, (unsigned long)[r count]);
             return r;
         }
     }
-    WFLOG(@"!! 未能定位会话列表，请查看下方 dump 信息");
+    WFLOG(@"未定位到会话列表");
     return nil;
 }
 
@@ -252,7 +243,7 @@ static BOOL WFIsChatroomSession(id session) {
     return NO;
 }
 
-#pragma mark - 诊断：dump 一个对象的 ivar / property / method
+#pragma mark - 诊断 dump
 
 static void WFDumpObject(id obj, NSString *tag) {
     if (!obj) { WFLOG(@"dump %@ -> nil", tag); return; }
@@ -262,62 +253,57 @@ static void WFDumpObject(id obj, NSString *tag) {
     unsigned int ivarCount = 0;
     Ivar *ivars = class_copyIvarList(cls, &ivarCount);
     for (unsigned int i = 0; i < ivarCount; i++) {
-        const char *n = ivar_getName(ivars[i]);
-        const char *t = ivar_getTypeEncoding(ivars[i]);
-        WFLOG(@"  ivar %s  (%s)", n ?: "?", t ?: "?");
+        WFLOG(@"  ivar %s (%s)", ivar_getName(ivars[i]) ?: "?", ivar_getTypeEncoding(ivars[i]) ?: "?");
     }
     free(ivars);
 
     unsigned int propCount = 0;
     objc_property_t *props = class_copyPropertyList(cls, &propCount);
     for (unsigned int i = 0; i < propCount; i++) {
-        WFLOG(@"  @property %s", property_getName(props[i]));
+        WFLOG(@"  prop %s", property_getName(props[i]));
     }
     free(props);
 
     unsigned int mCount = 0;
     Method *methods = class_copyMethodList(cls, &mCount);
     for (unsigned int i = 0; i < mCount; i++) {
-        SEL s = method_getName(methods[i]);
-        NSString *name = NSStringFromSelector(s);
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
         if ([name rangeOfString:@"old"].location != NSNotFound ||
             [name rangeOfString:@"Fold"].location != NSNotFound ||
-            [name rangeOfString:@"Session"].location != NSNotFound) {
+            [name rangeOfString:@"Session"].location != NSNotFound ||
+            [name rangeOfString:@"Chatroom"].location != NSNotFound) {
             WFLOG(@"  method %@", name);
         }
     }
     free(methods);
-    WFLOG(@"==== dump %@ end ====", tag);
+    WFLOG(@"==== dump %@ 结束 ====", tag);
 }
 
-#pragma mark - 业务：执行折叠 / 展开
+#pragma mark - 折叠逻辑
 
 static NSInteger gWFTotalSessions = 0;
 static NSInteger gWFChatrooms     = 0;
 static NSInteger gWFSuccess       = 0;
 
 static BOOL WFApplyFoldToSession(id session, BOOL fold) {
-    // 路线 A：KVC 直接写属性
     for (NSString *key in WFFoldKeys()) {
         if (WFSetBoolForKey(session, key, fold)) {
-            WFLOG(@"fold via KVC key: %@ = %@", key, fold ? @"YES" : @"NO");
+            WFLOG(@"折叠命中属性 %@ = %@", key, fold ? @"YES" : @"NO");
             return YES;
         }
     }
-    // 路线 B：调 setter 方法
     for (NSString *selName in WFFoldSelectors()) {
         if (WFCallWithBool(session, selName, fold)) {
-            WFLOG(@"fold via selector: -%@(%@)", selName, fold ? @"YES" : @"NO");
+            WFLOG(@"折叠命中方法 -%@(%@)", selName, fold ? @"YES" : @"NO");
             return YES;
         }
     }
-    // 路线 C：写到关联的联系人对象上
     for (NSString *ckey in WFContactKeys()) {
         id contact = WFValueForKey(session, ckey);
         if (!contact) continue;
         for (NSString *key in WFFoldKeys()) {
             if (WFSetBoolForKey(contact, key, fold)) {
-                WFLOG(@"fold via contact.%@ = %@", key, fold ? @"YES" : @"NO");
+                WFLOG(@"折叠命中联系人属性 %@ = %@", key, fold ? @"YES" : @"NO");
                 return YES;
             }
         }
@@ -345,7 +331,6 @@ static NSInteger WFRunFold(BOOL fold) {
         total++;
         if (WFApplyFoldToSession(session, fold)) {
             success++;
-            // 尝试落库
             for (NSString *saveSel in WFSaveSelectors()) {
                 if (WFCallWithObject(mgr, saveSel, session, NULL)) break;
             }
@@ -357,31 +342,58 @@ static NSInteger WFRunFold(BOOL fold) {
 
     gWFChatrooms = total;
     gWFSuccess = success;
-    WFLOG(@"%@ 群聊：成功 %ld / 群聊总数 %ld / 会话总数 %ld",
+    WFLOG(@"%@ 结果：成功 %ld / 群聊 %ld / 会话总数 %ld",
           fold ? @"折叠" : @"展开", (long)success, (long)total, (long)sessions.count);
 
-    // 刷新 UI
     for (NSString *selName in WFReloadSelectors()) {
-        if (WFCallNoArg(mgr, selName)) {
-            WFLOG(@"refresh via -%@", selName);
-            break;
-        }
+        if (WFCallNoArg(mgr, selName)) { WFLOG(@"刷新命中 -%@", selName); break; }
     }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"WeChatFoldReloadSessions"
-                                                            object:nil
-                                                          userInfo:@{@"fold": @(fold)}];
-    });
     return success;
 }
 
-#pragma mark - UI：悬浮按钮 + 菜单
+#pragma mark - UI 辅助
+
+static UIWindow *WFKeyWindow(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *w = nil;
+    if ([app respondsToSelector:@selector(keyWindow)]) w = app.keyWindow;
+    if (w) return w;
+    for (UIWindow *ww in app.windows) { if (ww.isKeyWindow) return ww; }
+    return app.windows.firstObject;
+}
+
+static UITableView *WFFindTableViewIn(UIView *root) {
+    if (!root) return nil;
+    if ([root isKindOfClass:[UITableView class]]) return (UITableView *)root;
+    for (UIView *sub in root.subviews) {
+        UITableView *t = WFFindTableViewIn(sub);
+        if (t) return t;
+    }
+    return nil;
+}
+
+#pragma mark - Hook 记录
+
+static NSMutableString *gWFHookReport = nil;
+
+static void WFNoteHook(NSString *clsName, NSString *role, BOOL ok) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gWFHookReport = [NSMutableString string]; });
+    [gWFHookReport appendFormat:@"%@ %@ (%@)\n", ok ? @"[OK]" : @"[--]", clsName, role];
+}
+
+#pragma mark - WFManager
 
 @interface WFManager : NSObject
 @property (nonatomic, strong) UIButton *button;
 @property (nonatomic, weak) UIView *hostView;
+@property (nonatomic, weak) UIViewController *lastVC;
+@property (nonatomic, weak) UIViewController *lastSettingVC;
 + (instancetype)shared;
 - (void)attachTo:(UIView *)view;
+- (void)injectSettingEntry:(UIViewController *)vc;
+- (void)showMenuFrom:(UIViewController *)vc;
+- (void)showBootAlertOn:(UIViewController *)vc;
 - (void)showLogFrom:(UIViewController *)vc;
 - (void)copyLogToPasteboard;
 - (void)closeLog;
@@ -396,15 +408,15 @@ static NSInteger WFRunFold(BOOL fold) {
     return m;
 }
 
+#pragma mark 悬浮按钮
+
 - (void)attachTo:(UIView *)view {
     if (!view || self.hostView == view) return;
     self.hostView = view;
     if (self.button) [self.button removeFromSuperview];
 
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = CGRectMake(view.bounds.size.width - 74,
-                           view.bounds.size.height - 220,
-                           58, 58);
+    btn.frame = CGRectMake(view.bounds.size.width - 74, view.bounds.size.height - 220, 58, 58);
     btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
     btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
     btn.layer.cornerRadius = 29;
@@ -413,14 +425,12 @@ static NSInteger WFRunFold(BOOL fold) {
     btn.titleLabel.numberOfLines = 2;
     [btn setTitle:@"群聊\n折叠" forState:UIControlStateNormal];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [btn addTarget:self action:@selector(onTap) forControlEvents:UIControlEventTouchUpInside];
-
-    // 支持拖动
+    [btn addTarget:self action:@selector(onButtonTap) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
     [btn addGestureRecognizer:pan];
-
     [view addSubview:btn];
     self.button = btn;
+    WFLOG(@"悬浮按钮已添加");
 }
 
 - (void)onPan:(UIPanGestureRecognizer *)g {
@@ -430,12 +440,77 @@ static NSInteger WFRunFold(BOOL fold) {
     [g setTranslation:CGPointZero inView:self.hostView];
 }
 
-- (void)onTap {
-    UIViewController *vc = [self currentVCFromView:self.hostView];
-    if (!vc) { WFLOG(@"can not find presenter VC"); return; }
+- (void)onButtonTap {
+    UIViewController *vc = [self presenterVC];
+    if (!vc) { WFLOG(@"找不到承载 VC"); return; }
+    [self showMenuFrom:vc];
+}
 
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"微信群聊折叠"
-                                                               message:@"选择操作（日志写入 Documents/WeChatFold.log）"
+- (UIViewController *)presenterVC {
+    if (self.lastVC) return self.lastVC;
+    UIResponder *r = self.hostView;
+    while (r) {
+        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+        r = [r nextResponder];
+    }
+    return WFKeyWindow().rootViewController;
+}
+
+#pragma mark 设置页入口
+
+- (void)injectSettingEntry:(UIViewController *)vc {
+    @try {
+        UITableView *tv = WFFindTableViewIn(vc.view);
+        if (!tv) return;
+        if (tv.tableFooterView && tv.tableFooterView.tag == 987654) return;
+
+        CGFloat w = tv.bounds.size.width > 0 ? tv.bounds.size.width : 320;
+        UIView *entry = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 56)];
+        entry.tag = 987654;
+        entry.backgroundColor = [UIColor whiteColor];
+
+        UIView *line = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 0.5)];
+        line.backgroundColor = [[UIColor grayColor] colorWithAlphaComponent:0.3];
+        [entry addSubview:line];
+
+        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(20, 8, w - 60, 40)];
+        lb.text = @"群聊批量折叠";
+        lb.font = [UIFont systemFontOfSize:16];
+        lb.textColor = [UIColor blackColor];
+        [entry addSubview:lb];
+
+        UILabel *arrow = [[UILabel alloc] initWithFrame:CGRectMake(w - 28, 16, 14, 24)];
+        arrow.text = @">";
+        arrow.font = [UIFont systemFontOfSize:15];
+        arrow.textColor = [[UIColor grayColor] colorWithAlphaComponent:0.6];
+        [entry addSubview:arrow];
+
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.frame = entry.bounds;
+        [btn addTarget:self action:@selector(onSettingEntryTap) forControlEvents:UIControlEventTouchUpInside];
+        [entry addSubview:btn];
+
+        self.lastSettingVC = vc;
+        tv.tableFooterView = entry;
+        WFLOG(@"设置页入口已注入：%@", NSStringFromClass([vc class]));
+    } @catch (NSException *e) {
+        WFLOG(@"设置页入口注入失败：%@", e.reason);
+    }
+}
+
+- (void)onSettingEntryTap {
+    UIViewController *vc = self.lastSettingVC ?: [self presenterVC];
+    if (!vc) return;
+    [self showMenuFrom:vc];
+}
+
+#pragma mark 菜单
+
+- (void)showMenuFrom:(UIViewController *)vc {
+    if (!vc) return;
+    self.lastVC = vc;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"微信群聊批量折叠"
+                                                               message:@"选择操作"
                                                         preferredStyle:UIAlertControllerStyleActionSheet];
 
     UIAlertAction *fold = [UIAlertAction actionWithTitle:@"折叠全部群聊"
@@ -451,12 +526,12 @@ static NSInteger WFRunFold(BOOL fold) {
         WFDumpObject(mgr, @"MMSessionMgr");
         NSArray *s = WFAllSessions(mgr);
         if (s.count) WFDumpObject(s.firstObject, @"Session[0]");
-        [self alert:@"已写入日志" from:vc];
+        [self alert:@"诊断信息已写入日志，点「查看日志」可以看到。" from:vc];
     }];
     UIAlertAction *viewLog = [UIAlertAction actionWithTitle:@"查看日志"
                                                      style:UIAlertActionStyleDefault
                                                    handler:^(UIAlertAction *a) { [self showLogFrom:vc]; }];
-    UIAlertAction *hide = [UIAlertAction actionWithTitle:@"隐藏按钮（本次运行）"
+    UIAlertAction *hide = [UIAlertAction actionWithTitle:@"隐藏悬浮按钮"
                                                    style:UIAlertActionStyleDestructive
                                                  handler:^(UIAlertAction *a) { self.button.hidden = YES; }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
@@ -465,11 +540,13 @@ static NSInteger WFRunFold(BOOL fold) {
     [ac addAction:viewLog]; [ac addAction:hide]; [ac addAction:cancel];
 
     if (ac.popoverPresentationController) {
-        ac.popoverPresentationController.sourceView = self.button;
-        ac.popoverPresentationController.sourceRect = self.button.bounds;
+        ac.popoverPresentationController.sourceView = self.button ?: vc.view;
+        ac.popoverPresentationController.sourceRect = self.button ? self.button.bounds : CGRectMake(0, 0, 1, 1);
     }
     [vc presentViewController:ac animated:YES completion:nil];
 }
+
+#pragma mark 执行
 
 - (void)run:(BOOL)fold from:(UIViewController *)vc {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -479,13 +556,13 @@ static NSInteger WFRunFold(BOOL fold) {
         dispatch_async(dispatch_get_main_queue(), ^{
             NSString *msg;
             if (n < 0) {
-                msg = @"失败：没找到会话列表。\n\n说明 MMSessionMgr 这个类或它的方法名对不上你的微信版本。\n\n点菜单里的「查看日志」，把日志发给我。";
+                msg = @"失败：没找到会话列表。\n\nMMSessionMgr 或它的方法名对不上你的微信版本。\n\n点「查看日志」把日志发给我。";
             } else if (totalSessions == 0) {
-                msg = @"失败：会话列表是空的。\n\n说明拿到了管理器但列表方法名不对。\n\n点「查看日志」把日志发给我。";
+                msg = @"失败：会话列表是空的。\n\n拿到了管理器，但取列表的方法名不对。\n\n点「查看日志」把日志发给我。";
             } else if (chatrooms == 0) {
-                msg = [NSString stringWithFormat:@"拿到了 %ld 条会话，但一条群聊都没认出来。\n\n说明群聊判断条件（@chatroom 后缀）没匹配上。\n\n点「查看日志」把日志发给我。", (long)totalSessions];
+                msg = [NSString stringWithFormat:@"拿到了 %ld 条会话，但一条群聊都没认出来。\n\n群聊判断条件没匹配上。\n\n点「查看日志」把日志发给我。", (long)totalSessions];
             } else if (n == 0) {
-                msg = [NSString stringWithFormat:@"认出 %ld 个群聊，但一个都没折叠成功。\n\n说明「折叠」相关的属性/方法名没命中。\n\n点「查看日志」，日志里会有 dump 出的真实属性名，发给我。", (long)chatrooms];
+                msg = [NSString stringWithFormat:@"认出 %ld 个群聊，但一个都没折叠成功。\n\n折叠用的属性/方法名没命中。\n\n日志里已 dump 出真实属性名，点「查看日志」发给我。", (long)chatrooms];
             } else {
                 msg = [NSString stringWithFormat:@"成功 %ld 个，共识别 %ld 个群聊（会话总数 %ld）。", (long)n, (long)chatrooms, (long)totalSessions];
             }
@@ -493,6 +570,53 @@ static NSInteger WFRunFold(BOOL fold) {
         });
     });
 }
+
+#pragma mark 启动自检弹窗
+
+- (NSString *)statusReport {
+    NSMutableString *s = [NSMutableString string];
+    [s appendString:@"插件已加载。状态如下：\n\n"];
+    [s appendFormat:@"%@", gWFHookReport ?: @"(hook 未执行)\n"];
+    [s appendString:@"\n"];
+    id mgr = WFGetService(NSClassFromString(kWFSessionMgrClass));
+    [s appendFormat:@"会话管理器：%@\n", mgr ? @"已找到" : @"未找到"];
+    if (mgr) {
+        NSArray *ss = WFAllSessions(mgr);
+        [s appendFormat:@"会话数量：%@\n", ss ? [NSString stringWithFormat:@"%lu", (unsigned long)ss.count] : @"取不到列表"];
+    }
+    return s;
+}
+
+- (void)showBootAlertOn:(UIViewController *)vc {
+    if (!vc) return;
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"WFBootAlertDisabled"]) return;
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"WeChatFold"
+                                                               message:[self statusReport]
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"折叠全部群聊"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [self run:YES from:vc]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"展开全部群聊"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [self run:NO from:vc]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"查看日志"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [self showLogFrom:vc]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"不再自动提示"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"WFBootAlertDisabled"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+
+    [vc presentViewController:ac animated:YES completion:nil];
+    WFLOG(@"启动自检弹窗已显示");
+}
+
+#pragma mark 日志查看器
 
 - (NSString *)logFilePath {
     NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -504,11 +628,9 @@ static NSInteger WFRunFold(BOOL fold) {
                                              encoding:NSUTF8StringEncoding
                                                 error:nil];
     if (!log || log.length == 0) {
-        log = @"(暂无日志)\n\n先点「输出诊断信息」或执行一次折叠，再回来看这里。";
+        log = @"(暂无日志)\n\n先执行一次折叠或诊断，再回来看这里。";
     }
-    if (log.length > 30000) {
-        log = [log substringFromIndex:log.length - 30000];
-    }
+    if (log.length > 30000) log = [log substringFromIndex:log.length - 30000];
 
     UIViewController *logVC = [[UIViewController alloc] init];
     logVC.title = @"WeChatFold 日志";
@@ -550,9 +672,10 @@ static NSInteger WFRunFold(BOOL fold) {
 }
 
 - (void)closeLog {
-    UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
-    [root dismissViewControllerAnimated:YES completion:nil];
+    [WFKeyWindow().rootViewController dismissViewControllerAnimated:YES completion:nil];
 }
+
+#pragma mark 通用弹窗
 
 - (void)alert:(NSString *)msg from:(UIViewController *)vc {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"微信群聊折叠"
@@ -562,46 +685,88 @@ static NSInteger WFRunFold(BOOL fold) {
     [vc presentViewController:ac animated:YES completion:nil];
 }
 
-- (UIViewController *)currentVCFromView:(UIView *)v {
-    UIResponder *r = v;
-    while (r) {
-        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
-        r = [r nextResponder];
-    }
-    return [UIApplication sharedApplication].keyWindow.rootViewController;
-}
-
 @end
 
-#pragma mark - 注入入口：hook MainFrameViewController
+#pragma mark - Hook 安装
 
-static void WFInstallHooks(void) {
-    Class cls = NSClassFromString(kWFMainFrameClass);
-    if (!cls) { WFLOG(@"class %@ not found", kWFMainFrameClass); return; }
+static NSMutableSet<NSString *> *gWFHooked = nil;
+
+static void WFHookViewDidAppear(Class cls, BOOL isSetting) {
+    if (!cls) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gWFHooked = [NSMutableSet set]; });
+
+    NSString *clsName = NSStringFromClass(cls);
+    if ([gWFHooked containsObject:clsName]) return;
 
     SEL sel = @selector(viewDidAppear:);
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) { WFLOG(@"%@ has no viewDidAppear:", kWFMainFrameClass); return; }
+    if (!m) {
+        WFNoteHook(clsName, isSetting ? @"设置页" : @"主界面", NO);
+        WFLOG(@"%@ 没有 viewDidAppear:", clsName);
+        return;
+    }
+    [gWFHooked addObject:clsName];
 
-    __block IMP origIMP = method_getImplementation(m);
+    IMP orig = method_getImplementation(m);
     IMP newIMP = imp_implementationWithBlock(^(id _self, BOOL animated) {
-        if (origIMP) ((void (*)(id, SEL, BOOL))origIMP)(_self, sel, animated);
+        if (orig) ((void (*)(id, SEL, BOOL))orig)(_self, sel, animated);
         @try {
-            if ([_self respondsToSelector:@selector(view)]) {
-                UIView *v = [(UIViewController *)_self view];
-                if (v) [[WFManager shared] attachTo:v];
+            if ([_self isKindOfClass:[UIViewController class]]) {
+                UIViewController *vc = (UIViewController *)_self;
+                [[WFManager shared] setLastVC:vc];
+                if (isSetting) {
+                    [[WFManager shared] injectSettingEntry:vc];
+                } else if ([vc respondsToSelector:@selector(view)]) {
+                    [[WFManager shared] attachTo:vc.view];
+                }
             }
-        } @catch (NSException *e) { WFLOG(@"attach failed: %@", e.reason); }
+        } @catch (NSException *e) {
+            WFLOG(@"hook 回调异常：%@", e.reason);
+        }
     });
     method_setImplementation(m, newIMP);
-    WFLOG(@"hook installed on %@", kWFMainFrameClass);
+    WFNoteHook(clsName, isSetting ? @"设置页" : @"主界面", YES);
+    WFLOG(@"已 hook %@", clsName);
 }
+
+static void WFInstallHooks(void) {
+    BOOL anyMain = NO, anySetting = NO;
+    for (NSString *name in WFMainFrameCandidates()) {
+        Class c = NSClassFromString(name);
+        if (c) { WFHookViewDidAppear(c, NO); anyMain = YES; }
+    }
+    for (NSString *name in WFSettingCandidates()) {
+        Class c = NSClassFromString(name);
+        if (c) { WFHookViewDidAppear(c, YES); anySetting = YES; }
+    }
+    if (!anyMain) WFLOG(@"主界面候选类名一个都没命中");
+    if (!anySetting) WFLOG(@"设置页候选类名一个都没命中");
+}
+
+#pragma mark - 启动自检调度
+
+static void WFTryBootAlert(int attempt) {
+    if (attempt > 25) { WFLOG(@"启动弹窗：超时未找到根控制器"); return; }
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"WFBootAlertDisabled"]) return;
+
+    UIViewController *root = WFKeyWindow().rootViewController;
+    if (!root || !root.view.window) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ WFTryBootAlert(attempt + 1); });
+        return;
+    }
+    [[WFManager shared] showBootAlertOn:root];
+}
+
+#pragma mark - 入口
 
 __attribute__((constructor))
 static void WFEntry(void) {
-    WFLOG(@"dylib loaded (pid=%d)", getpid());
+    WFLOG(@"=== WeChatFold dylib 已加载 (pid=%d) ===", getpid());
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try { WFInstallHooks(); }
-        @catch (NSException *e) { WFLOG(@"init failed: %@", e.reason); }
+        @catch (NSException *e) { WFLOG(@"安装 hook 失败：%@", e.reason); }
+        WFTryBootAlert(0);
     });
 }
