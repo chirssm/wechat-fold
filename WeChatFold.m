@@ -1207,6 +1207,7 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 @property (nonatomic, strong) NSArray<NSNumber *> *jobTargets;
 @property (nonatomic, strong) NSArray *jobModels;
 @property (nonatomic, strong) NSArray *tokenCache;
+@property (nonatomic, copy) NSString *refNote;
 @property (nonatomic, assign) NSInteger jobIndex;
 @property (nonatomic, assign) NSInteger jobDone;
 @property (nonatomic, assign) NSInteger jobAlready;
@@ -1235,8 +1236,7 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 - (NSString *)pageDisplayName:(UIViewController *)vc;
 - (NSArray *)currentRowModels:(UITableView *)tv;
 - (WFSelectionRef *)findSelectionRef:(UIViewController *)vc
-                              models:(NSArray *)models
-                                note:(NSMutableString *)note;
+                              models:(NSArray *)models;
 - (void)startJob:(NSInteger)action table:(UITableView *)tv vc:(UIViewController *)vc;
 - (void)runJobChunk;
 - (void)finishJob;
@@ -1688,9 +1688,9 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 }
 
 // 在页面（以及页面上的逻辑对象）里找真正的「已勾选集合」
+// 过程说明写到 self.refNote，调用方按需读日志
 - (WFSelectionRef *)findSelectionRef:(UIViewController *)vc
-                              models:(NSArray *)models
-                                note:(NSMutableString *)note {
+                              models:(NSArray *)models {
     if (!vc || !models.count) return nil;
 
     NSMutableArray *owners = [NSMutableArray arrayWithObject:vc];
@@ -1796,10 +1796,10 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         if ((NSInteger)arr.count < bestCount) { bestCount = (NSInteger)arr.count; best = ref; }
     }
 
-    if (note) {
-        [note appendFormat:@"候选集合：%@\n", tried.length ? tried : @"(无)"];
-        [note appendFormat:@"采用：%@\n", best ? best.desc : @"(无，退回逐个 cell 判断)"];
-    }
+    NSMutableString *note = [NSMutableString string];
+    [note appendFormat:@"候选集合：%@\n", tried.length ? tried : @"(无)"];
+    [note appendFormat:@"采用：%@", best ? best.desc : @"(无，退回逐个 cell 判断)"];
+    self.refNote = note;
     return best;
 }
 
@@ -1816,10 +1816,9 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     }
 
     NSArray *models = [self currentRowModels:tv];
-    NSMutableString *note = [NSMutableString string];
     self.tokenCache = nil;                 // 每进一次面板都重算，避免串页
-    WFSelectionRef *ref = [self findSelectionRef:vc models:models note:&note];
-    if (note.length) WFLOG(@"%@", note);
+    WFSelectionRef *ref = [self findSelectionRef:vc models:models];
+    if (self.refNote.length) WFLOG(@"%@", self.refNote);
 
     NSInteger total = 0, rooms = 0, others = 0, unknownRoom = 0;
     for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
@@ -1949,9 +1948,8 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     if (!tv || !self.jobRunning) { self.jobRunning = NO; return; }
 
     // 每个分块重新找一次勾选集 —— 微信可能每勾一次就换一个新数组
-    NSMutableString *note = [NSMutableString string];
-    WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels note:&note];
-    if (self.jobIndex == 0 && note.length) WFLOG(@"%@", note);
+    WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels];
+    if (self.jobIndex == 0 && self.refNote.length) WFLOG(@"%@", self.refNote);
 
     id del = tv.delegate;
     NSInteger total = (NSInteger)self.jobTargets.count;
@@ -2002,8 +2000,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     self.jobRunning = NO;
     UITableView *tv = self.jobTable;
 
-    NSMutableString *note = [NSMutableString string];
-    WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels note:&note];
+    WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels];
 
     NSInteger ok = 0, bad = 0, unknown = 0;
     if (tv) {
