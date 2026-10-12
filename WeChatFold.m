@@ -1,6 +1,28 @@
 //
-//  WeChatFold.m  v10
+//  WeChatFold.m  v11
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
+//
+//  v11 变更（修掉「只勾上一部分群、剩下的没动」）：
+//  1. 【根因 1：状态误判】v10 把「认亲集合」排在状态判断的最前面，而认亲集合
+//     是靠「对象身上的所有字符串」比对的，里面必然混着"群聊""折叠""勿扰"这类
+//     通用词 —— 只要候选集合含一个通用词，所有行都会被判成“已勾选”，于是
+//     全选一行都不点。用户看到的就是“只有原本勾着的群（＝已在折叠列表、默认
+//     免打扰的群）还是勾的”。现在：
+//       a) 通用词（出现在一半以上行里的字符串）全部剔除，不参与比对；
+//       b) 认亲集合必须「至少两个专属字符串对上」才算命中，杜绝单词假阳性；
+//       c) 一个指针都没对上时，认亲集合直接放弃判断（返回“判不出”），
+//          而不是硬报“已勾选”；
+//       d) 状态读取顺序反转：cell.isSelected → 系统多选集合 → accessory →
+//          cell 标志 → 图标名 → 最后才是认亲集合。
+//  2. 【根因 2：行对象取错】行数据对象原来只按分区号去索引 dataSource 的数组
+//     成员，而那个数组列表是按 ivar 顺序出来的，不保证等于分区顺序。现在优先
+//     按分区取，落空时再按“长度等于总行数的平铺数组”取。
+//  3. 【群聊判定增强】新增「分区标题」判定：微信「选择朋友」页把群和人分成两个
+//     区，区标题写着「群聊」「联系人」，整区定性比猜对象可靠得多。
+//  4. 【点击闭环】复检发现不符的行会自动补点，最多两轮（微信的勾选回调常是
+//     异步的，第一次点不生效）。
+//  5. 新增「状态预览」：弹窗直接列出每行「群/人、已勾/未勾、依据、cell 文字」，
+//     手机上就能看出插件读得对不对，不用翻日志。
 //
 //  v10 变更（修掉「全选变成反选」这个致命 bug）：
 //  1. 【关键修复】页面上「点一下」是翻转语义（已勾→取消，未勾→勾上），v8/v9 把
@@ -56,7 +78,7 @@
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
 
 // 版本号：日志、启动弹窗、设置页入口都会显示，用来确认新 dylib 是否真的装上
-static NSString * const kWFVersion = @"v10";
+static NSString * const kWFVersion = @"v11";
 
 // 设置页候选类名（只在这里注入入口）
 static NSArray<NSString *> *WFSettingCandidates(void) {
@@ -423,23 +445,80 @@ static NSArray *WFDataSourceLists(id ds) {
     return out;
 }
 
-// 从 dataSource 的数组 ivar 里按行取数据对象（多分区时按分区序号取对应数组）
-static id WFObjectForRow(id ds, NSIndexPath *ip) {
-    if (!ds || !ip) return nil;
+// 表格总行数
+static NSInteger WFRowTotal(UITableView *tv) {
+    NSInteger n = 0;
+    if (!tv) return 0;
+    for (NSInteger s = 0; s < [tv numberOfSections]; s++) n += [tv numberOfRowsInSection:s];
+    return n;
+}
+
+// 某一行在整张表里的全局序号（跨分区累加）
+static NSInteger WFGlobalRowIndex(UITableView *tv, NSIndexPath *ip) {
+    NSInteger n = ip ? ip.row : 0;
+    if (!tv || !ip) return n;
+    for (NSInteger s = 0; s < ip.section; s++) n += [tv numberOfRowsInSection:s];
+    return n;
+}
+
+// 取某一行的「候选数据对象」。
+// 旧版只按 ip.section 去索引 dataSource 的数组型成员，但那个数组列表是靠遍历
+// ivar 得来的，顺序不保证等于分区顺序，dataSource 里又常有别的数组（已选列表、
+// 分组、搜索结果…），一旦错位，整行取到的就是别的区的对象 —— 这正是「只有一部分
+// 群被认出来」的原因之一。现在改为：优先按分区取，落空时再按“平铺数组”取。
+static NSArray *WFObjectCandidatesForRow(id ds, NSIndexPath *ip, NSInteger globalIndex, NSInteger total) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (!ds || !ip) return out;
     NSArray *lists = WFDataSourceLists(ds);
-    if (!lists.count) return nil;
-    NSArray *a = nil;
-    if ((NSUInteger)ip.section < lists.count) a = lists[(NSUInteger)ip.section];
-    if (!a) a = lists.firstObject;
-    if (!a || a.count <= (NSUInteger)ip.row) return nil;
-    return a[(NSUInteger)ip.row];
+    if (!lists.count) return out;
+
+    // 来源 1：多分区 —— 一个区一个数组
+    if ((NSUInteger)ip.section < lists.count) {
+        NSArray *a = lists[(NSUInteger)ip.section];
+        if ((NSUInteger)ip.row < a.count) {
+            id o = a[(NSUInteger)ip.row];
+            if (o) [out addObject:o];
+        }
+    }
+    if (out.count) return out;      // 有结果就不混入其它来源，避免误判
+
+    // 来源 2：平铺 —— 一个数组装下所有行，长度正好等于总行数
+    if (total > 0 && globalIndex >= 0) {
+        for (NSArray *a in lists) {
+            if ((NSInteger)a.count != total) continue;
+            if ((NSUInteger)globalIndex >= a.count) continue;
+            id o = a[(NSUInteger)globalIndex];
+            if (o && ![out containsObject:o]) [out addObject:o];
+        }
+    }
+    return out;
 }
 
 // 判断某一行是不是群聊：1=是  0=不是  -1=判断不出来
 static NSInteger WFRowChatroomState(UITableView *tv, NSIndexPath *ip) {
     @try {
-        id obj = WFObjectForRow(tv.dataSource, ip);
-        if (obj) return WFObjectHasChatroomTag(obj, 0) ? 1 : 0;
+        // 手法 0（最强）：分区标题。微信「选择朋友」页通常把群和人分成两个区，
+        // 区标题写着「群聊」「联系人」，整区定性比猜对象可靠得多。
+        if ([tv.dataSource respondsToSelector:@selector(tableView:titleForHeaderInSection:)]) {
+            id h = [tv.dataSource tableView:tv titleForHeaderInSection:ip.section];
+            if ([h isKindOfClass:[NSString class]] && [(NSString *)h length]) {
+                NSString *hs = (NSString *)h;
+                if ([hs containsString:@"群"]) return 1;
+                if ([hs containsString:@"联系人"] || [hs containsString:@"朋友"] ||
+                    [hs containsString:@"好友"] || [hs containsString:@"同事"]) return 0;
+            }
+        }
+
+        // 手法 1：行数据对象（含 @chatroom 即判为群）
+        NSInteger total = WFRowTotal(tv);
+        NSArray *cands = WFObjectCandidatesForRow(tv.dataSource, ip,
+                                                  WFGlobalRowIndex(tv, ip), total);
+        if (cands.count) {
+            for (id o in cands) if (WFObjectHasChatroomTag(o, 0)) return 1;
+            return 0;
+        }
+
+        // 手法 2（原有兜底）：扫 cell 身上挂的对象
         UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
         if (cell) {
             unsigned int ic = 0;
@@ -510,11 +589,32 @@ static NSSet<NSString *> *WFIdentityTokens(id obj, int depth) {
     return out;
 }
 
+// 统计每个「身份字符串」在全部行里出现的频率。
+// 出现得太普遍的（例如“群聊”“折叠”“勿扰”“联系人”这类词、以及各种 UI 类型名）
+// 一律视为通用词丢弃 —— 它们是「全选一行都不点」的元凶：只要候选集合里含有
+// 任意一个通用词，所有行都会被误判成“已勾选”，于是代码认为无需点击。
+static NSSet<NSString *> *WFCommonTokens(NSArray<NSSet<NSString *> *> *tokenSets) {
+    NSMutableSet *out = [NSMutableSet set];
+    if (tokenSets.count < 3) return out;      // 样本太小，不做过滤，免得误杀
+    NSMutableDictionary<NSString *, NSNumber *> *freq = [NSMutableDictionary dictionary];
+    for (NSSet<NSString *> *s in tokenSets) {
+        for (NSString *t in s) freq[t] = @(freq[t].integerValue + 1);
+    }
+    NSInteger limit = (NSInteger)tokenSets.count / 2;
+    if (limit < 2) limit = 2;
+    for (NSString *t in freq) {
+        if (freq[t].integerValue >= limit) [out addObject:t];   // 一半以上的行都有 → 通用词
+    }
+    return out;
+}
+
 // 已勾选集合的引用：把容器里的对象与字符串预先摊平，便于快速判断某行在不在里面
 @interface WFSelectionRef : NSObject
 @property (nonatomic, strong) NSArray *objects;
 @property (nonatomic, strong) NSSet<NSString *> *strings;
-@property (nonatomic, copy) NSString *desc;
+@property (nonatomic, strong) NSSet<NSString *> *ignoreTokens;   // 通用词，比对时跳过
+@property (nonatomic, copy)   NSString *desc;
+@property (nonatomic, assign) NSInteger pointerHits;             // 指针级命中数，0 = 不可信
 - (NSInteger)stateForModel:(id)model;   // 1=已勾选 0=未勾选 -1=判断不了
 @end
 
@@ -522,12 +622,19 @@ static NSSet<NSString *> *WFIdentityTokens(id obj, int depth) {
 
 - (NSInteger)stateForModel:(id)model {
     if (!model || model == [NSNull null]) return -1;
-    for (id o in self.objects) if (o == model) return 1;   // 指针相同
+    for (id o in self.objects) if (o == model) return 1;   // 指针相同，最可信
+    // 一个指针都没对上，说明这个容器装的并不是当前页面的行对象。
+    // 这种时候绝不能返回 0 或 1 —— 那会把整页判成“已勾选”（全选于是什么都不做）。
+    // 返回 -1，让上层退回去用系统接口 / cell 状态判断。
+    if (self.pointerHits <= 0) return -1;
     NSSet<NSString *> *tok = WFIdentityTokens(model, 0);
-    if (tok.count && self.strings.count) {
-        for (NSString *t in tok) if ([self.strings containsObject:t]) return 1;
+    if (!tok.count || !self.strings.count) return 0;
+    NSInteger hit = 0;
+    for (NSString *t in tok) {
+        if ([self.ignoreTokens containsObject:t]) continue;   // 通用词不算数
+        if ([self.strings containsObject:t]) hit++;
     }
-    return 0;
+    return (hit >= 2) ? 1 : 0;    // 至少两个“专属”字符串对上才算，杜绝单词假阳性
 }
 
 @end
@@ -576,6 +683,12 @@ static NSInteger WFCellBOOLState(UITableViewCell *cell, NSString **nameOut) {
             for (NSString *k in keys) if ([n containsString:k]) { hit = YES; break; }
             if (!hit) continue;
             if ([n containsString:@"Enable"] || [n containsString:@"hidden"]) continue;
+            // 排除语义无关的字段，避免把高亮/悬停/免打扰当成“已勾选”
+            if ([n containsString:@"highLight"] || [n containsString:@"highlight"] ||
+                [n containsString:@"Hover"] || [n containsString:@"hover"] ||
+                [n containsString:@"Focus"] || [n containsString:@"focus"] ||
+                [n containsString:@"Mute"] || [n containsString:@"mute"] ||
+                [n containsString:@"Unread"] || [n containsString:@"unread"]) continue;
             ptrdiff_t off = ivar_getOffset(ivs[i]);
             char *base = (char *)(__bridge void *)cell;
             char val = *(base + off);
@@ -616,29 +729,49 @@ static NSInteger WFCellIconState(UITableViewCell *cell, NSString **howOut) {
 }
 
 // 读某一行的勾选状态：1=已勾选 0=未勾选 -1=判断不了
+//
+// 顺序很关键。旧版把「认亲集合」放在最前面，一旦认错集合（字符串假阳性），
+// 整页都会被判成“已勾选”，于是全选一行都不点 —— 表现在界面上就是
+// “只有原本就勾着的群（＝已在折叠列表里、默认免打扰的群）还是勾的”。
+// 现在把最可靠的系统级证据排到前面，「认亲集合」降级为最后兜底。
 static NSInteger WFRowCheckedState(UITableView *tv, NSIndexPath *ip, NSString **howOut) {
     if (!tv || !ip) return -1;
-    // 1) 系统自带多选
+
+    UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
+
+    // 1) cell.isSelected —— UITableViewCell 标准属性，微信自绘多选时一般也会设
+    if (cell && cell.isSelected) {
+        if (howOut) *howOut = @"cell.isSelected";
+        return 1;
+    }
+
+    // 2) 系统多选集合。只有它「非空」时才能当权威依据；一个都没有，可能意味着
+    //    微信压根没用这套机制，不能据此断定“全未勾选”，得继续找别的证据。
     if (tv.allowsMultipleSelection) {
         NSArray<NSIndexPath *> *sel = tv.indexPathsForSelectedRows;
-        if (howOut) *howOut = @"系统多选";
-        return [sel containsObject:ip] ? 1 : 0;
+        if (sel.count > 0) {
+            if (howOut) *howOut = @"系统多选";
+            return [sel containsObject:ip] ? 1 : 0;
+        }
     }
-    UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
-    if (!cell) return -1;                    // 行还没被创建出来
-    // 2) cell 自己的 BOOL 勾选标志
+
+    if (!cell) return -1;                    // 行还没被创建出来，读不了
+
+    // 3) 系统 accessory 勾
+    if (cell.accessoryType == UITableViewCellAccessoryCheckmark) {
+        if (howOut) *howOut = @"accessory 勾";
+        return 1;
+    }
+
+    // 4) cell 自己的 BOOL 勾选标志
     NSString *bn = nil;
     NSInteger st = WFCellBOOLState(cell, &bn);
     if (st >= 0) {
         if (howOut) *howOut = [NSString stringWithFormat:@"cell 标志 %@", bn];
         return st;
     }
-    // 3) 系统 accessory 勾
-    if (cell.accessoryType == UITableViewCellAccessoryCheckmark) {
-        if (howOut) *howOut = @"accessory 勾";
-        return 1;
-    }
-    // 4) 勾选框图标名
+
+    // 5) 勾选框图标名
     NSString *in = nil;
     st = WFCellIconState(cell, &in);
     if (st >= 0) { if (howOut) *howOut = in; return st; }
@@ -1219,6 +1352,7 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 @property (nonatomic, assign) NSInteger jobRooms;
 @property (nonatomic, copy) NSString *jobTitle;
 @property (nonatomic, assign) BOOL jobRunning;
+@property (nonatomic, assign) NSInteger jobRetryRound;   // 复检不符时的补点轮次（最多 2 轮）
 + (instancetype)shared;
 - (void)injectSettingEntry:(UIViewController *)vc;
 - (void)showMenuFrom:(UIViewController *)vc;
@@ -1240,6 +1374,10 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 - (void)startJob:(NSInteger)action table:(UITableView *)tv vc:(UIViewController *)vc;
 - (void)runJobChunk;
 - (void)finishJob;
+- (void)previewRowStates:(UITableView *)tv
+                      vc:(UIViewController *)vc
+                     ref:(WFSelectionRef *)ref
+                  models:(NSArray *)models;
 - (void)dumpSelectionDiagnostics:(UITableView *)tv
                               vc:(UIViewController *)vc
                              ref:(WFSelectionRef *)ref
@@ -1678,9 +1816,13 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 - (NSArray *)currentRowModels:(UITableView *)tv {
     NSMutableArray *a = [NSMutableArray array];
     if (!tv) return a;
+    NSInteger total = WFRowTotal(tv);
     for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
         for (NSInteger r = 0; r < [tv numberOfRowsInSection:s]; r++) {
-            id o = WFObjectForRow(tv.dataSource, [NSIndexPath indexPathForRow:r inSection:s]);
+            NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:s];
+            NSArray *cands = WFObjectCandidatesForRow(tv.dataSource, ip,
+                                                      WFGlobalRowIndex(tv, ip), total);
+            id o = cands.firstObject;
             [a addObject:o ?: [NSNull null]];
         }
     }
@@ -1752,6 +1894,8 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         mt = tmp;
         self.tokenCache = mt;
     }
+    // 通用词（“群聊”“折叠”“勿扰”之类）全部剔除，否则它们会让每一行都“对上”
+    NSSet<NSString *> *ignore = WFCommonTokens(mt);
 
     WFSelectionRef *best = nil;
     NSInteger bestCount = NSIntegerMax;
@@ -1778,26 +1922,41 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         }
         if (!objs.count && !strs.count) continue;
 
-        NSInteger score = 0;
-        for (id o in objs) for (id m in models) if (m == o) { score++; break; }
+        NSInteger ptrHits = 0, strHits = 0;
+        for (id o in objs) for (id m in models) if (m == o) { ptrHits++; break; }
         for (NSSet<NSString *> *t in mt) {
             if (!t.count) continue;
-            for (NSString *s in t) if ([strs containsObject:s]) { score++; break; }
+            NSInteger h = 0;
+            for (NSString *s in t) {
+                if ([ignore containsObject:s]) continue;   // 通用词不算数
+                if ([strs containsObject:s]) h++;
+            }
+            if (h >= 2) strHits++;                          // 至少两个“专属”字符串才算一行对上
         }
-        [tried appendFormat:@"%@=%ld/%lu ", c[@"name"], (long)score, (unsigned long)arr.count];
-        if (score <= 0) continue;
-        if (score * 2 < (NSInteger)arr.count) continue;   // 大部分对不上，不是勾选集
+        [tried appendFormat:@"%@=指针%ld/文字%ld/%lu项 ", c[@"name"],
+              (long)ptrHits, (long)strHits, (unsigned long)arr.count];
+        if (ptrHits <= 0 && strHits <= 0) continue;
+        // 准入：要么有指针级命中，要么文字命中覆盖多数行。
+        // 门槛一松，就会把「全部好友」「全部分组」这类集合误当成勾选集。
+        if (ptrHits <= 0 && strHits * 2 < (NSInteger)models.count) continue;
 
         WFSelectionRef *ref = [[WFSelectionRef alloc] init];
         ref.objects = objs;
         ref.strings = strs;
-        ref.desc = [NSString stringWithFormat:@"%@（%lu 项，对上 %ld）",
-                    c[@"name"], (unsigned long)arr.count, (long)score];
-        if ((NSInteger)arr.count < bestCount) { bestCount = (NSInteger)arr.count; best = ref; }
+        ref.ignoreTokens = ignore;
+        ref.pointerHits = ptrHits;
+        ref.desc = [NSString stringWithFormat:@"%@（%lu 项，指针对上 %ld，文字对上 %ld）",
+                    c[@"name"], (unsigned long)arr.count, (long)ptrHits, (long)strHits];
+        BOOL better = NO;
+        if (!best) better = YES;
+        else if (ptrHits > 0 && best.pointerHits <= 0) better = YES;
+        else if ((ptrHits > 0) == (best.pointerHits > 0) && (NSInteger)arr.count < bestCount) better = YES;
+        if (better) { bestCount = (NSInteger)arr.count; best = ref; }
     }
 
     NSMutableString *note = [NSMutableString string];
     [note appendFormat:@"候选集合：%@\n", tried.length ? tried : @"(无)"];
+    [note appendFormat:@"已剔除通用词 %lu 个\n", (unsigned long)ignore.count];
     [note appendFormat:@"采用：%@", best ? best.desc : @"(无，退回逐个 cell 判断)"];
     self.refNote = note;
     return best;
@@ -1830,15 +1989,15 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     }
 
     NSInteger checked = 0, unknowable = 0;
-    if (ref) {
-        for (id m in models) {
-            NSInteger st = [ref stateForModel:m];
-            if (st == 1) checked++; else if (st < 0) unknowable++;
-        }
-    } else {
-        for (NSIndexPath *ip in [tv indexPathsForVisibleRows]) {
+    for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
+        for (NSInteger r = 0; r < [tv numberOfRowsInSection:s]; r++) {
+            NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:s];
             NSString *how = nil;
-            NSInteger st = WFRowCheckedState(tv, ip, &how);
+            NSInteger st = WFRowCheckedState(tv, ip, &how);        // 可靠来源优先
+            if (st < 0 && ref) {
+                NSInteger gi = WFGlobalRowIndex(tv, ip);
+                if ((NSUInteger)gi < models.count) st = [ref stateForModel:models[(NSUInteger)gi]];
+            }
             if (st == 1) checked++; else if (st < 0) unknowable++;
         }
     }
@@ -1850,11 +2009,12 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     if (unknownRoom) [msg appendFormat:@"群聊判断不确定 %ld 行\n", (long)unknownRoom];
     if (ref) {
         [msg appendFormat:@"当前已勾选 %ld 行\n", (long)checked];
-        if (unknowable) [msg appendFormat:@"状态判不出 %ld 行\n", (long)unknowable];
-        [msg appendFormat:@"依据：%@", ref.desc];
+        if (unknowable) [msg appendFormat:@"状态判不出 %ld 行（这些行不会动）\n", (long)unknowable];
+        [msg appendFormat:@"判定依据：%@", ref.desc];
     } else {
-        [msg appendFormat:@"屏幕上可见行里已勾选 %ld 行\n", (long)checked];
-        [msg appendString:@"⚠️ 读不到完整勾选状态，只能判断看得见的行；判不出的行一律不点。"];
+        [msg appendFormat:@"当前已勾选 %ld 行\n", (long)checked];
+        if (unknowable) [msg appendFormat:@"状态判不出 %ld 行（这些行不会动）\n", (long)unknowable];
+        [msg appendString:@"判定依据：逐个 cell 判断"];
     }
     WFLOG(@"勾选面板：%ld 行（群聊 %ld / 非群聊 %ld / 不确定 %ld），已勾选 %ld，依据=%@",
           (long)total, (long)rooms, (long)others, (long)unknownRoom, (long)checked,
@@ -1878,6 +2038,11 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
                                              style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *x) {
         [wself startJob:WFSelectActionInvert table:tv vc:vc];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"状态预览（看插件读到了什么）"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) {
+        [wself previewRowStates:tv vc:vc ref:ref models:models];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"状态自检（写进日志）"
                                              style:UIAlertActionStyleDefault
@@ -1929,6 +2094,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     self.jobModels = [self currentRowModels:tv];
     self.tokenCache = nil;
     self.jobIndex = 0;
+    self.jobRetryRound = 0;
     self.jobDone = self.jobAlready = self.jobSkip = self.jobFail = self.jobUnknown = 0;
     self.jobAction = action;
     self.jobTotal = total;
@@ -1970,8 +2136,9 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 
             NSString *how = nil;
             NSInteger cur = -1;
-            if (ref && (NSUInteger)i < self.jobModels.count) cur = [ref stateForModel:self.jobModels[(NSUInteger)i]];
-            if (cur < 0) cur = WFRowCheckedState(tv, ip, &how);
+            cur = WFRowCheckedState(tv, ip, &how);          // 可靠来源优先
+            if (cur < 0 && ref && (NSUInteger)i < self.jobModels.count)
+                cur = [ref stateForModel:self.jobModels[(NSUInteger)i]];   // 认亲集合只作兜底
             // 状态判不出来就绝对不动它 —— 盲目点击 = 把状态翻转，正是之前的 bug
             if (cur < 0) { self.jobUnknown++; continue; }
 
@@ -1997,11 +2164,11 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 }
 
 - (void)finishJob {
-    self.jobRunning = NO;
     UITableView *tv = self.jobTable;
 
     WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels];
 
+    NSMutableArray<NSNumber *> *retry = [NSMutableArray array];
     NSInteger ok = 0, bad = 0, unknown = 0;
     if (tv) {
         for (NSInteger i = 0; i < (NSInteger)self.jobTargets.count; i++) {
@@ -2009,14 +2176,43 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
             if (target < 0) continue;
             NSIndexPath *ip = self.jobPaths[(NSUInteger)i];
             NSString *how = nil;
-            NSInteger cur = -1;
-            if (ref && (NSUInteger)i < self.jobModels.count) cur = [ref stateForModel:self.jobModels[(NSUInteger)i]];
-            if (cur < 0) cur = WFRowCheckedState(tv, ip, &how);
-            if (cur < 0) unknown++;
-            else if (cur == target) ok++;
-            else bad++;
+            NSInteger cur = WFRowCheckedState(tv, ip, &how);          // 可靠来源优先
+            if (cur < 0 && ref && (NSUInteger)i < self.jobModels.count)
+                cur = [ref stateForModel:self.jobModels[(NSUInteger)i]];
+            if (cur < 0) { unknown++; continue; }
+            if (cur == target) { ok++; continue; }
+            bad++;
+            [retry addObject:@(i)];
         }
     }
+
+    // 复检不符的行再补点一轮 —— 微信的勾选回调经常是异步的，第一次点不生效
+    if (tv && bad > 0 && self.jobRetryRound < 2) {
+        self.jobRetryRound++;
+        WFLOG(@"复检不符 %ld 行，补第 %ld 轮点击", (long)bad, (long)self.jobRetryRound);
+        id del = tv.delegate;
+        for (NSNumber *n in retry) {
+            NSInteger i = n.integerValue;
+            @try {
+                NSIndexPath *ip = self.jobPaths[(NSUInteger)i];
+                if (![tv cellForRowAtIndexPath:ip]) {
+                    [tv scrollToRowAtIndexPath:ip atScrollPosition:UITableViewScrollPositionMiddle animated:NO];
+                    [tv layoutIfNeeded];
+                }
+                if (del) [del tableView:tv didSelectRowAtIndexPath:ip];
+                self.jobDone++;
+            } @catch (NSException *e) {
+                self.jobFail++;
+                WFLOG(@"补点第 %ld 行异常：%@", (long)i, e.reason);
+            }
+        }
+        __weak WFManager *wself = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [wself finishJob]; });
+        return;                     // 保持 jobRunning，避免补点期间被重复触发
+    }
+
+    self.jobRunning = NO;
 
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"%@ 完成\n\n", self.jobTitle];
@@ -2040,6 +2236,60 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
           (long)self.jobUnknown, (long)self.jobFail, (long)ok, (long)bad, (long)unknown);
 
     [self alert:s from:WFTopViewController()];
+}
+
+// 状态预览：把插件「读到了什么」直接显示在手机上，不用翻日志。
+// 每行给出：分区-行号 / 群还是人 / 勾选状态 / 判断依据 / cell 上的文字
+- (void)previewRowStates:(UITableView *)tv
+                      vc:(UIViewController *)vc
+                     ref:(WFSelectionRef *)ref
+                  models:(NSArray *)models {
+    if (!tv) { [self alert:@"找不到列表" from:vc]; return; }
+
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"列表：%@（%ld 个分区）\n",
+          NSStringFromClass([tv class]), (long)[tv numberOfSections]];
+    [s appendFormat:@"勾选集依据：%@\n\n", ref ? ref.desc : @"(无，逐个 cell 判断)"];
+
+    NSInteger total = WFRowTotal(tv);
+    NSInteger shown = 0;
+    for (NSInteger sec = 0; sec < [tv numberOfSections]; sec++) {
+        if ([tv.dataSource respondsToSelector:@selector(tableView:titleForHeaderInSection:)]) {
+            id h = [tv.dataSource tableView:tv titleForHeaderInSection:sec];
+            if ([h isKindOfClass:[NSString class]] && [(NSString *)h length])
+                [s appendFormat:@"— 分区%ld 标题「%@」—\n", (long)sec, h];
+        }
+        NSInteger rowsInSec = [tv numberOfRowsInSection:sec];
+        for (NSInteger r = 0; r < rowsInSec && shown < 15; r++) {
+            NSIndexPath *ip = [NSIndexPath indexPathForRow:r inSection:sec];
+            NSInteger room = WFRowChatroomState(tv, ip);
+            NSString *how = nil;
+            NSInteger st = WFRowCheckedState(tv, ip, &how);
+            if (st < 0 && ref) {
+                NSInteger gi = WFGlobalRowIndex(tv, ip);
+                if ((NSUInteger)gi < models.count) {
+                    st = [ref stateForModel:models[(NSUInteger)gi]];
+                    how = @"认亲集合";
+                }
+            }
+            UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
+            NSMutableArray<NSString *> *txts = [NSMutableArray array];
+            if (cell) WFCollectTexts(cell, txts, 0);
+            NSString *brief = txts.count ? [txts componentsJoinedByString:@"|"] : @"";
+            if (brief.length > 34) brief = [[brief substringToIndex:34] stringByAppendingString:@"…"];
+            [s appendFormat:@"%ld-%ld %@ %@ [%@]%@\n",
+                  (long)sec, (long)r,
+                  room > 0 ? @"群" : (room == 0 ? @"人" : @"?"),
+                  st == 1 ? @"已勾" : (st == 0 ? @"未勾" : @"判不出"),
+                  how.length ? how : @"-",
+                  brief.length ? [@" " stringByAppendingString:brief] : @""];
+            shown++;
+        }
+    }
+    if (total > shown) [s appendFormat:@"…还有 %ld 行，请看日志\n", (long)(total - shown)];
+
+    WFLOG(@"==== 状态预览 ====\n%@", s);
+    [self alert:s from:vc];
 }
 
 // 状态自检：把「怎么判断勾选状态」的证据全写进日志，方便一次定位
