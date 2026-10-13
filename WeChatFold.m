@@ -1,6 +1,19 @@
 //
-//  WeChatFold.m  v11
+//  WeChatFold.m  v12
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
+//
+//  v12 变更（解决「折叠后置顶丢失」）：
+//  背景：微信官方设计 —— 置顶与折叠互斥，只能二选一。把一个置顶群折叠，
+//  微信会自动取消它的置顶；之后再取消折叠只移除折叠标记，绝不恢复置顶。
+//  也就是说，置顶的群一旦被折叠，「置顶」就永久丢了（手动折叠也一样）。
+//  对策：
+//  1. 【全选跳过置顶群】执行「全选折叠」时自动跳过已置顶的群 —— 它们不参与
+//     折叠，就永远不会掉置顶（微信本来也不允许置顶+折叠共存）。
+//  2. 【记录 / 恢复置顶】新增「记录置顶名单」把当前所有置顶群存到本地；
+//     万一已经丢过置顶，用「恢复置顶」把名单里的群重新置顶回来。
+//  3. 置顶标志多来源探测：候选属性名 → 联系人对象属性 → 暴力扫名字里带
+//     top / sticky 的布尔 ivar。都读不到就判「不确定」，宁可不碰。
+//  4. 新增「诊断5：扫描置顶机制」，把每个群读到的置顶状态与依据写进日志。
 //
 //  v11 变更（修掉「只勾上一部分群、剩下的没动」）：
 //  1. 【根因 1：状态误判】v10 把「认亲集合」排在状态判断的最前面，而认亲集合
@@ -78,7 +91,7 @@
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
 
 // 版本号：日志、启动弹窗、设置页入口都会显示，用来确认新 dylib 是否真的装上
-static NSString * const kWFVersion = @"v11";
+static NSString * const kWFVersion = @"v12";
 
 // 设置页候选类名（只在这里注入入口）
 static NSArray<NSString *> *WFSettingCandidates(void) {
@@ -129,6 +142,26 @@ static NSArray<NSString *> *WFContactKeys(void) {
 static NSArray<NSString *> *WFSaveSelectors(void) {
     return @[@"UpdateSession:", @"updateSession:", @"saveSession:", @"ModifySession:", @"reloadSession"];
 }
+
+// 「是否置顶」候选属性名（KVC 读；微信里置顶标志多半带 top / sticky）
+static NSArray<NSString *> *WFTopKeys(void) {
+    return @[@"m_bIsTop", @"m_bTop", @"m_bTopSession", @"m_bIsSticky",
+             @"m_bSticky", @"isTop", @"m_bSessionTop", @"m_uiTopFlag",
+             @"m_bTopFlag", @"m_bIsTopSession", @"m_bMarkTop",
+             @"m_bConversationTop", @"m_bChatTop", @"m_bTopConversation"];
+}
+
+// 「设置置顶」候选方法名（BOOL 参数）
+static NSArray<NSString *> *WFTopSelectors(void) {
+    return @[@"setM_bIsTop:", @"SetTop:", @"setIsTop:", @"setTop:",
+             @"setM_bTop:", @"setSticky:", @"setM_bIsSticky:",
+             @"setSessionTop:", @"setM_bSessionTop:", @"markTop:",
+             @"setTopSession:", @"setM_bConversationTop:"];
+}
+
+// 置顶名单在本地的存储键
+static NSString * const kWF_PIN_LIST = @"WFLastPinnedList";
+static NSString * const kWF_PIN_TIME = @"WFLastPinnedTime";
 
 #pragma mark - 日志
 
@@ -1303,6 +1336,163 @@ static NSInteger WFRunFold(BOOL fold, NSArray *sessions, id mgr) {
     return success;
 }
 
+#pragma mark - 置顶逻辑
+//
+//  微信里「置顶」和「折叠」互斥：把一个置顶群折叠，微信会自动取消它的置顶；
+//  之后再取消折叠，置顶也不会回来。所以折叠前必须先把置顶群记下来 ——
+//  要么折叠时跳过它们，要么事后用名单恢复。
+//  置顶标志的字段名未知，这里用「候选名 + 暴力扫 ivar」多来源探测。
+
+// 名字像不像「置顶」标志（排除 stop / topic / tip 这类误伤）
+static BOOL WFIsTopIvarName(NSString *n) {
+    if (!n.length) return NO;
+    NSString *low = n.lowercaseString;
+    if ([low containsString:@"topic"] || [low containsString:@"stop"] ||
+        [low containsString:@"tip"]) return NO;
+    return ([low containsString:@"top"] || [low containsString:@"sticky"]);
+}
+
+// 该类（含父类）上到底有没有这个「键」——有方法或同名 ivar 才算。
+// 先问这个再走 KVC，免得对着几百行反复抛「未知键」异常，把主线程拖住。
+static BOOL WFClassHasKey(Class cls, NSString *key) {
+    if (!cls || !key.length) return NO;
+    static NSMutableDictionary<NSString *, NSSet<NSString *> *> *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+
+    NSString *cn = NSStringFromClass(cls);
+    NSSet<NSString *> *set = cache[cn];
+    if (!set) {
+        NSMutableSet<NSString *> *names = [NSMutableSet set];
+        Class c = cls;
+        int lv = 0;
+        while (c && c != [NSObject class] && lv < 6) {
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(c, &mc);
+            for (unsigned int i = 0; i < mc; i++) [names addObject:NSStringFromSelector(method_getName(ms[i]))];
+            free(ms);
+            unsigned int ic = 0;
+            Ivar *ivs = class_copyIvarList(c, &ic);
+            for (unsigned int i = 0; i < ic; i++) {
+                const char *nm = ivar_getName(ivs[i]);
+                if (nm) [names addObject:[NSString stringWithUTF8String:nm]];
+            }
+            free(ivs);
+            c = class_getSuperclass(c);
+            lv++;
+        }
+        set = names;
+        cache[cn] = set;
+    }
+    if ([set containsObject:key]) return YES;
+    if (![key hasPrefix:@"_"]) return [set containsObject:[@"_" stringByAppendingString:key]];
+    return NO;
+}
+
+// 读一个会话的置顶状态：1=置顶 0=未置顶 -1=判不出
+static NSInteger WFSessionTopState(id session, NSString **howOut) {
+    if (!session) return -1;
+
+    // 1) 候选属性名（KVC 命中 ivar 或同名 getter）
+    for (NSString *key in WFTopKeys()) {
+        if (!WFClassHasKey([session class], key)) continue;
+        id v = WFValueForKey(session, key);
+        if (v && [v respondsToSelector:@selector(boolValue)]) {
+            if (howOut) *howOut = [NSString stringWithFormat:@"属性 %@", key];
+            return [v boolValue] ? 1 : 0;
+        }
+    }
+
+    // 2) 会话挂的联系人对象上的同名属性
+    for (NSString *ckey in WFContactKeys()) {
+        id contact = WFValueForKey(session, ckey);
+        if (!contact) continue;
+        for (NSString *key in WFTopKeys()) {
+            if (!WFClassHasKey([contact class], key)) continue;
+            id v = WFValueForKey(contact, key);
+            if (v && [v respondsToSelector:@selector(boolValue)]) {
+                if (howOut) *howOut = [NSString stringWithFormat:@"联系人属性 %@", key];
+                return [v boolValue] ? 1 : 0;
+            }
+        }
+    }
+
+    // 3) 暴力扫：名字里带 top / sticky 的布尔成员（含父类，最多 4 层）
+    Class cls = [session class];
+    int level = 0;
+    while (cls && cls != [NSObject class] && level < 4) {
+        unsigned int ic = 0;
+        Ivar *ivs = class_copyIvarList(cls, &ic);
+        for (unsigned int i = 0; i < ic; i++) {
+            const char *te = ivar_getTypeEncoding(ivs[i]) ?: "";
+            if (!(te[0] == 'B' || te[0] == 'c' || te[0] == 'C')) continue;
+            NSString *n = [NSString stringWithUTF8String:ivar_getName(ivs[i]) ?: ""];
+            if (!WFIsTopIvarName(n)) continue;
+            ptrdiff_t off = ivar_getOffset(ivs[i]);
+            char *base = (char *)(__bridge void *)session;
+            char val = *(base + off);
+            free(ivs);
+            if (howOut) *howOut = [NSString stringWithFormat:@"ivar %@", n];
+            return val ? 1 : 0;
+        }
+        free(ivs);
+        cls = class_getSuperclass(cls);
+        level++;
+    }
+    return -1;
+}
+
+// 把一个会话设为置顶 / 取消置顶：候选方法 → 候选属性 → 联系人属性
+static BOOL WFApplyTopToSession(id session, BOOL top) {
+    if (!session) return NO;
+    for (NSString *selName in WFTopSelectors()) {
+        if (WFCallWithBool(session, selName, top)) {
+            WFLOG(@"置顶命中方法 -%@(%@)", selName, top ? @"YES" : @"NO");
+            return YES;
+        }
+    }
+    for (NSString *key in WFTopKeys()) {
+        if (WFSetBoolForKey(session, key, top)) {
+            WFLOG(@"置顶命中属性 %@ = %@", key, top ? @"YES" : @"NO");
+            return YES;
+        }
+    }
+    for (NSString *ckey in WFContactKeys()) {
+        id contact = WFValueForKey(session, ckey);
+        if (!contact) continue;
+        for (NSString *key in WFTopKeys()) {
+            if (WFSetBoolForKey(contact, key, top)) {
+                WFLOG(@"置顶命中联系人属性 %@ = %@", key, top ? @"YES" : @"NO");
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+// 取所有会话（先走服务，再退回界面）
+static NSArray *WFCurrentSessions(void) {
+    id mgr = WFGetSessionMgr();
+    NSArray *s = mgr ? WFAllSessions(mgr) : nil;
+    if (!s) s = WFSessionsFromUI();
+    return s;
+}
+
+// 某一行对应的会话名（用于和置顶名单比对）
+static NSString *WFRowUserNameForIndex(NSArray *models, NSInteger idx) {
+    if (idx < 0 || (NSUInteger)idx >= models.count) return nil;
+    id m = models[(NSUInteger)idx];
+    NSString *u = WFSessionUserName(m);
+    if (u.length) return u;
+    for (NSString *ck in WFContactKeys()) {
+        id c = WFValueForKey(m, ck);
+        if (!c) continue;
+        NSString *cu = WFSessionUserName(c);
+        if (cu.length) return cu;
+    }
+    return nil;
+}
+
 static void WFReloadVisibleTables(void) {
     UIWindow *w = WFKeyWindow();
     if (!w) return;
@@ -1353,6 +1543,8 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 @property (nonatomic, copy) NSString *jobTitle;
 @property (nonatomic, assign) BOOL jobRunning;
 @property (nonatomic, assign) NSInteger jobRetryRound;   // 复检不符时的补点轮次（最多 2 轮）
+@property (nonatomic, assign) NSInteger jobPinned;         // 因「已置顶」被主动跳过的行数
+@property (nonatomic, strong) NSSet<NSString *> *pinnedSet; // 本次全选要跳过的置顶群
 + (instancetype)shared;
 - (void)injectSettingEntry:(UIViewController *)vc;
 - (void)showMenuFrom:(UIViewController *)vc;
@@ -1382,6 +1574,11 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
                               vc:(UIViewController *)vc
                              ref:(WFSelectionRef *)ref
                           models:(NSArray *)models;
+- (NSSet<NSString *> *)refreshPinnedSet;
+- (void)recordPinnedListFrom:(UIViewController *)vc;
+- (void)restorePinnedListFrom:(UIViewController *)vc;
+- (void)scanTopMechanismFrom:(UIViewController *)vc;
+- (BOOL)isPinnedRowAtIndex:(NSInteger)i models:(NSArray *)models pinSet:(NSSet<NSString *> *)pinSet;
 @end
 
 @implementation WFManager
@@ -1475,6 +1672,12 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     UIAlertAction *unfold = [UIAlertAction actionWithTitle:@"展开全部群聊"
                                                      style:UIAlertActionStyleDefault
                                                    handler:^(UIAlertAction *a) { [self run:NO from:vc]; }];
+    UIAlertAction *record = [UIAlertAction actionWithTitle:@"记录置顶名单（折叠前先做）"
+                                                    style:UIAlertActionStyleDefault
+                                                  handler:^(UIAlertAction *a) { [self recordPinnedListFrom:vc]; }];
+    UIAlertAction *restore = [UIAlertAction actionWithTitle:@"恢复置顶（用已记录的名单）"
+                                                     style:UIAlertActionStyleDefault
+                                                   handler:^(UIAlertAction *a) { [self restorePinnedListFrom:vc]; }];
     UIAlertAction *diag1 = [UIAlertAction actionWithTitle:@"诊断1：扫描服务中心"
                                                     style:UIAlertActionStyleDefault
                                                   handler:^(UIAlertAction *a) {
@@ -1505,6 +1708,12 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         WFDumpFoldClasses();
         [self alert:@"已扫描折叠机制与插件环境。点「查看日志」→「复制全部」发给我。" from:vc];
     }];
+    UIAlertAction *diag5 = [UIAlertAction actionWithTitle:@"诊断5：扫描置顶机制"
+                                                    style:UIAlertActionStyleDefault
+                                                  handler:^(UIAlertAction *a) {
+        WFLOG(@"==== 用户触发：扫描置顶机制 ====");
+        [self scanTopMechanismFrom:vc];
+    }];
     UIAlertAction *viewLog = [UIAlertAction actionWithTitle:@"查看日志"
                                                      style:UIAlertActionStyleDefault
                                                    handler:^(UIAlertAction *a) { [self showLogFrom:vc]; }];
@@ -1514,7 +1723,8 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
 
     [ac addAction:fold]; [ac addAction:unfold];
-    [ac addAction:diag1]; [ac addAction:diag2]; [ac addAction:diag3]; [ac addAction:diag4];
+    [ac addAction:record]; [ac addAction:restore];
+    [ac addAction:diag1]; [ac addAction:diag2]; [ac addAction:diag3]; [ac addAction:diag4]; [ac addAction:diag5];
     [ac addAction:viewLog]; [ac addAction:clear]; [ac addAction:cancel];
 
     if (ac.popoverPresentationController) {
@@ -1565,6 +1775,144 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
             [self alert:msg from:vc];
         });
     });
+}
+
+#pragma mark 置顶名单（记录 / 恢复）
+
+// 扫描当前会话，把置顶的群并进本地名单；返回并集
+- (NSSet<NSString *> *)refreshPinnedSet {
+    NSArray<NSString *> *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:kWF_PIN_LIST];
+    NSMutableSet<NSString *> *set = [NSMutableSet setWithArray:saved ?: @[]];
+    NSUInteger before = set.count;
+    NSArray *sessions = WFCurrentSessions();
+    NSInteger pinned = 0;
+    for (id s in sessions) {
+        if (!WFIsChatroomSession(s)) continue;
+        if (WFSessionTopState(s, NULL) != 1) continue;
+        pinned++;
+        NSString *u = WFSessionUserName(s);
+        if (u.length) [set addObject:u];
+    }
+    if (set.count != before) {
+        [[NSUserDefaults standardUserDefaults] setObject:set.allObjects forKey:kWF_PIN_LIST];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }
+    WFLOG(@"置顶名单刷新：现读置顶群 %ld 个，名单共 %lu 个",
+          (long)pinned, (unsigned long)set.count);
+    return set;
+}
+
+// 某一行是不是「已置顶」：行对象自带标志，或会话名命中已记录的置顶名单
+- (BOOL)isPinnedRowAtIndex:(NSInteger)i models:(NSArray *)models pinSet:(NSSet<NSString *> *)pinSet {
+    if (i < 0 || (NSUInteger)i >= models.count) return NO;
+    id m = models[(NSUInteger)i];
+    if (WFSessionTopState(m, NULL) == 1) return YES;
+    NSString *u = WFRowUserNameForIndex(models, i);
+    if (u.length && pinSet && [pinSet containsObject:u]) return YES;
+    return NO;
+}
+
+// 记录置顶名单（覆盖式快照）
+- (void)recordPinnedListFrom:(UIViewController *)vc {
+    NSArray *sessions = WFCurrentSessions();
+    if (!sessions.count) {
+        [self alert:@"拿不到会话列表，记录不了。\n\n请先在设置页点「诊断2」把日志发我。" from:vc];
+        return;
+    }
+    NSMutableArray<NSString *> *pins = [NSMutableArray array];
+    NSMutableString *detail = [NSMutableString string];
+    NSInteger scanned = 0, unsure = 0;
+    for (id s in sessions) {
+        if (!WFIsChatroomSession(s)) continue;
+        scanned++;
+        NSString *how = nil;
+        NSInteger st = WFSessionTopState(s, &how);
+        if (st < 0) unsure++;
+        if (st == 1) {
+            NSString *u = WFSessionUserName(s);
+            if (u.length) [pins addObject:u];
+            if (detail.length < 500) [detail appendFormat:@"· %@（%@）\n", u ?: @"?", how ?: @"-"];
+        }
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:pins forKey:kWF_PIN_LIST];
+    [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kWF_PIN_TIME];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    WFLOG(@"==== 记录置顶名单：扫群聊 %ld 个，置顶 %lu 个，判不出 %ld 个 ====\n%@",
+          (long)scanned, (unsigned long)pins.count, (long)unsure, pins);
+    NSString *tail = pins.count
+        ? detail
+        : @"一个都没读出来。说明置顶标志的字段名还没命中，请点「诊断5：扫描置顶机制」把日志发我。";
+    [self alert:[NSString stringWithFormat:@"扫描群聊 %ld 个，认出置顶 %lu 个。\n\n%@\n\n以后「全选折叠」会自动跳过这些群。",
+                 (long)scanned, (unsigned long)pins.count, tail] from:vc];
+}
+
+// 用名单把群重新置顶
+- (void)restorePinnedListFrom:(UIViewController *)vc {
+    NSArray<NSString *> *pins = [[NSUserDefaults standardUserDefaults] arrayForKey:kWF_PIN_LIST];
+    if (!pins.count) {
+        [self alert:@"还没有置顶名单。\n\n请先点「记录置顶名单」；或做一次「全选折叠」，它会自动记录。" from:vc];
+        return;
+    }
+    NSArray *sessions = WFCurrentSessions();
+    if (!sessions.count) { [self alert:@"拿不到会话列表，恢复不了。" from:vc]; return; }
+
+    NSSet<NSString *> *want = [NSSet setWithArray:pins];
+    id mgr = WFGetSessionMgr();
+    NSInteger matched = 0, ok = 0, already = 0, fail = 0;
+    NSMutableString *failed = [NSMutableString string];
+    for (id s in sessions) {
+        if (!WFIsChatroomSession(s)) continue;
+        NSString *u = WFSessionUserName(s);
+        if (!u.length || ![want containsObject:u]) continue;
+        matched++;
+        if (WFSessionTopState(s, NULL) == 1) { already++; continue; }
+        if (WFApplyTopToSession(s, YES)) {
+            ok++;
+            if (mgr) for (NSString *saveSel in WFSaveSelectors()) if (WFCallWithObject(mgr, saveSel, s, NULL)) break;
+        } else {
+            fail++;
+            if (failed.length < 200) [failed appendFormat:@"%@ ", u];
+        }
+    }
+    WFReloadVisibleTables();
+    WFLOG(@"==== 恢复置顶：名单 %lu 个，命中会话 %ld 个，本次置顶 %ld 个，本来已置顶 %ld 个，失败 %ld 个 ====",
+          (unsigned long)pins.count, (long)matched, (long)ok, (long)already, (long)fail);
+    NSString *msg;
+    if (matched == 0) {
+        msg = [NSString stringWithFormat:@"名单里 %lu 个群，在当前会话列表里一个都没找到。\n\n可能已退群/被删，或名单是旧的。", (unsigned long)pins.count];
+    } else if (ok == 0 && already == 0) {
+        msg = [NSString stringWithFormat:@"找到 %ld 个群，但一个都没置顶成功（字段名没命中）。\n\n请点「诊断5」把日志发我。失败：%@", (long)matched, failed];
+    } else {
+        msg = [NSString stringWithFormat:@"找到 %ld 个群：\n新置顶 %ld 个\n本来就没掉 %ld 个\n失败 %ld 个\n\n列表没立刻更新的话，退回聊天页再进来看。%@",
+               (long)matched, (long)ok, (long)already, (long)fail,
+               fail ? [NSString stringWithFormat:@"\n\n失败：%@", failed] : @""];
+    }
+    [self alert:msg from:vc];
+}
+
+// 诊断5：把置顶机制读到的证据写进日志
+- (void)scanTopMechanismFrom:(UIViewController *)vc {
+    WFLOG(@"==== 置顶机制扫描开始 ====");
+    NSArray *sessions = WFCurrentSessions();
+    WFLOG(@"会话总数：%lu", (unsigned long)sessions.count);
+    NSInteger shown = 0, rooms = 0;
+    for (id s in sessions) {
+        if (!WFIsChatroomSession(s)) continue;
+        rooms++;
+        if (shown < 25) {
+            NSString *how = nil;
+            NSInteger st = WFSessionTopState(s, &how);
+            WFLOG(@"  群 %@ | 置顶=%@ | 依据=%@",
+                  WFSessionUserName(s) ?: @"?", st == 1 ? @"是" : (st == 0 ? @"否" : @"?"), how ?: @"-");
+            shown++;
+        }
+    }
+    WFLOG(@"群聊共 %ld 个（上面最多列 25 个）", (long)rooms);
+    for (id s in sessions) {
+        if (WFIsChatroomSession(s)) { WFDumpObject(s, @"置顶扫描 Session"); break; }
+    }
+    WFLOG(@"==== 置顶机制扫描结束 ====");
+    [self alert:@"扫描完成。点「查看日志」→ 左上角「复制全部」发我。" from:vc];
 }
 
 #pragma mark 启动自检弹窗
@@ -1979,6 +2327,17 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     WFSelectionRef *ref = [self findSelectionRef:vc models:models];
     if (self.refNote.length) WFLOG(@"%@", self.refNote);
 
+    // 已置顶的群：名单命中 或 行对象自带置顶标志 —— 全选时会跳过它们
+    NSArray<NSString *> *pinList = [[NSUserDefaults standardUserDefaults] arrayForKey:kWF_PIN_LIST];
+    NSSet<NSString *> *pinSet = pinList.count ? [NSSet setWithArray:pinList] : nil;
+    NSInteger pinnedRows = 0;
+    for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
+        for (NSInteger r = 0; r < [tv numberOfRowsInSection:s]; r++) {
+            NSInteger gi = WFGlobalRowIndex(tv, [NSIndexPath indexPathForRow:r inSection:s]);
+            if ([self isPinnedRowAtIndex:gi models:models pinSet:pinSet]) pinnedRows++;
+        }
+    }
+
     NSInteger total = 0, rooms = 0, others = 0, unknownRoom = 0;
     for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
         for (NSInteger r = 0; r < [tv numberOfRowsInSection:s]; r++) {
@@ -2007,6 +2366,8 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     [msg appendFormat:@"共 %ld 行，识别为群聊 %ld 行\n", (long)total, (long)rooms];
     if (others) [msg appendFormat:@"非群聊 %ld 行（不会碰）\n", (long)others];
     if (unknownRoom) [msg appendFormat:@"群聊判断不确定 %ld 行\n", (long)unknownRoom];
+    if (pinnedRows) [msg appendFormat:@"已置顶 %ld 行（全选会跳过，避免掉置顶）\n", (long)pinnedRows];
+    if (!pinList.count) [msg appendString:@"⚠️ 还没记录置顶名单，折叠置顶群会永久丢置顶\n"];
     if (ref) {
         [msg appendFormat:@"当前已勾选 %ld 行\n", (long)checked];
         if (unknowable) [msg appendFormat:@"状态判不出 %ld 行（这些行不会动）\n", (long)unknowable];
@@ -2024,9 +2385,12 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
                                                                   message:msg
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
     __weak WFManager *wself = self;
-    [sheet addAction:[UIAlertAction actionWithTitle:@"全选（只勾群聊）"
+    [sheet addAction:[UIAlertAction actionWithTitle:@"全选（只勾群聊、跳过已置顶）"
                                              style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *x) {
+        // 名单还空着（第一次用）：先自动记一次，免得折叠把置顶吃掉
+        NSArray *cur = [[NSUserDefaults standardUserDefaults] arrayForKey:kWF_PIN_LIST];
+        if (!cur.count) [wself refreshPinnedSet];
         [wself startJob:WFSelectActionAll table:tv vc:vc];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消全选（只取消群聊）"
@@ -2064,6 +2428,10 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 - (void)startJob:(NSInteger)action table:(UITableView *)tv vc:(UIViewController *)vc {
     NSMutableArray<NSIndexPath *> *paths = [NSMutableArray array];
     NSMutableArray<NSNumber *> *roomStates = [NSMutableArray array];
+    NSArray *models = [self currentRowModels:tv];
+    NSArray<NSString *> *pinList = [[NSUserDefaults standardUserDefaults] arrayForKey:kWF_PIN_LIST];
+    NSSet<NSString *> *pinSet = pinList.count ? [NSSet setWithArray:pinList] : nil;
+    self.pinnedSet = pinSet;
     NSInteger total = 0, rooms = 0, others = 0, unknown = 0;
     for (NSInteger s = 0; s < [tv numberOfSections]; s++) {
         for (NSInteger r = 0; r < [tv numberOfRowsInSection:s]; r++) {
@@ -2079,19 +2447,29 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 
     BOOL chatroomOnly = (rooms > 0);
     NSMutableArray<NSNumber *> *targets = [NSMutableArray array];
+    NSInteger pinnedSkip = 0;
     for (NSInteger i = 0; i < total; i++) {
         NSInteger st = [roomStates[(NSUInteger)i] integerValue];
         if (chatroomOnly && st == 0) { [targets addObject:@(-1)]; continue; }   // 非群聊行不动
-        if (action == WFSelectActionAll) [targets addObject:@(1)];
+        if (action == WFSelectActionAll) {
+            // 已置顶的群直接跳过：微信里折叠会取消置顶，而且不可恢复
+            if ([self isPinnedRowAtIndex:i models:models pinSet:pinSet]) {
+                [targets addObject:@(-3)];
+                pinnedSkip++;
+                continue;
+            }
+            [targets addObject:@(1)];
+        }
         else if (action == WFSelectActionNone) [targets addObject:@(0)];
         else [targets addObject:@(-2)];                                        // 反选：运行时取反
     }
+    self.jobPinned = pinnedSkip;
 
     self.jobTable = tv;
     self.jobVC = vc;
     self.jobPaths = paths;
     self.jobTargets = targets;
-    self.jobModels = [self currentRowModels:tv];
+    self.jobModels = models;
     self.tokenCache = nil;
     self.jobIndex = 0;
     self.jobRetryRound = 0;
@@ -2103,8 +2481,8 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
                      (action == WFSelectActionNone ? @"取消全选" : @"反选"));
     self.jobRunning = YES;
 
-    WFLOG(@"==== %@ 开始：共 %ld 行（群聊 %ld / 非群聊 %ld / 不确定 %ld），范围=%@ ====",
-          self.jobTitle, (long)total, (long)rooms, (long)others, (long)unknown,
+    WFLOG(@"==== %@ 开始：共 %ld 行（群聊 %ld / 非群聊 %ld / 不确定 %ld），已置顶跳过 %ld 行，范围=%@ ====",
+          self.jobTitle, (long)total, (long)rooms, (long)others, (long)unknown, (long)pinnedSkip,
           chatroomOnly ? @"只处理群聊行" : @"一行群聊都没认出，退化为处理全部行");
     [self runJobChunk];
 }
@@ -2126,6 +2504,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
         NSIndexPath *ip = self.jobPaths[(NSUInteger)i];
         NSInteger target = [targets[(NSUInteger)i] integerValue];
         if (target == -1) { self.jobSkip++; continue; }
+        if (target == -3) { continue; }        // 已置顶行：早已计入 jobPinned，不动
 
         @try {
             // 微信的勾选回调多半会去取 cell，所以先保证 cell 存在
@@ -2219,6 +2598,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     [s appendFormat:@"实际点击：%ld 行\n", (long)self.jobDone];
     [s appendFormat:@"本来就是目标状态：%ld 行\n", (long)self.jobAlready];
     if (self.jobSkip) [s appendFormat:@"非群聊跳过：%ld 行\n", (long)self.jobSkip];
+    if (self.jobPinned) [s appendFormat:@"已置顶跳过（避免掉置顶）：%ld 行\n", (long)self.jobPinned];
     if (self.jobUnknown) [s appendFormat:@"状态判不出、没动它：%ld 行\n", (long)self.jobUnknown];
     if (self.jobFail) [s appendFormat:@"执行出错：%ld 行\n", (long)self.jobFail];
     [s appendFormat:@"\n复检：符合 %ld 行", (long)ok];
