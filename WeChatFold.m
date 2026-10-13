@@ -1,6 +1,20 @@
 //
-//  WeChatFold.m  v12
+//  WeChatFold.m  v13
 //  微信群聊批量折叠 —— TrollStore / 巨魔注入版
+//
+//  v13 变更（针对「取消全选之后过一会又被折叠」）：
+//  1. 【补点不再盲点】v12 的复检补点一旦发现「状态不符」就直接再点一次，而
+//     「点一下」是翻转语义 —— 万一状态读错了，这一下反而把已经取消的行重新
+//     勾上，表现出来正好是「取消完过一会又被折叠」。现在补点前必须重新读一次
+//     状态，确实不符才点；且只认可靠依据（cell.isSelected 是粘性信号，点过之后
+//     它未必还准，一律不参与补点）。读不准就跳过，绝不盲点。
+//  2. 【任务代次】每次「全选 / 取消全选 / 反选」都会作废上一个任务：旧任务残留
+//     的分块执行块、补点定时块全部因代次不符而失效，不再串到新任务上互相踩。
+//  3. 【收尾快照 + 回潮复查】任务结束立刻把每行「期望 / 实际 / 判定依据」写进
+//     日志，并在约 4 秒、10 秒后各再读一遍。若复查时发现行自己变回已勾选，那就是
+//     页面外部在改（微信自身同步或其它插件）；若一直是取消状态，则问题出在
+//     「没点微信的完成」这一提交环节或外部，与本插件无关。
+//  4. 完成提示语改为明确要求点微信自己的「完成」提交。
 //
 //  v12 变更（解决「折叠后置顶丢失」）：
 //  背景：微信官方设计 —— 置顶与折叠互斥，只能二选一。把一个置顶群折叠，
@@ -91,7 +105,7 @@
 static NSString * const kWFSessionMgrClass = @"MMSessionMgr";
 
 // 版本号：日志、启动弹窗、设置页入口都会显示，用来确认新 dylib 是否真的装上
-static NSString * const kWFVersion = @"v12";
+static NSString * const kWFVersion = @"v13";
 
 // 设置页候选类名（只在这里注入入口）
 static NSArray<NSString *> *WFSettingCandidates(void) {
@@ -1545,6 +1559,7 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 @property (nonatomic, assign) NSInteger jobRetryRound;   // 复检不符时的补点轮次（最多 2 轮）
 @property (nonatomic, assign) NSInteger jobPinned;         // 因「已置顶」被主动跳过的行数
 @property (nonatomic, strong) NSSet<NSString *> *pinnedSet; // 本次全选要跳过的置顶群
+@property (nonatomic, assign) NSInteger jobGeneration;      // 任务代次：新任务作废旧任务的延迟块
 + (instancetype)shared;
 - (void)injectSettingEntry:(UIViewController *)vc;
 - (void)showMenuFrom:(UIViewController *)vc;
@@ -1566,6 +1581,8 @@ static void WFNoteHook(NSString *clsName, BOOL ok, NSString *note) {
 - (void)startJob:(NSInteger)action table:(UITableView *)tv vc:(UIViewController *)vc;
 - (void)runJobChunk;
 - (void)finishJob;
+- (void)jobSnapshotLog:(NSString *)tag;
+- (void)scheduleDriftCheckAfter:(NSTimeInterval)delay round:(NSInteger)round;
 - (void)previewRowStates:(UITableView *)tv
                       vc:(UIViewController *)vc
                      ref:(WFSelectionRef *)ref
@@ -2426,6 +2443,12 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 }
 
 - (void)startJob:(NSInteger)action table:(UITableView *)tv vc:(UIViewController *)vc {
+    // 作废上一个还在跑的任务：它的分块块 / 补点块随后会因代次不符而失效，
+    // 不会再串到这次的新任务上互相踩（这正是「全选完立刻取消全选」的隐患）
+    if (self.jobRunning) WFLOG(@"上一个任务「%@」还在执行，先作废", self.jobTitle ?: @"?");
+    self.jobRunning = NO;
+    self.jobGeneration++;
+
     NSMutableArray<NSIndexPath *> *paths = [NSMutableArray array];
     NSMutableArray<NSNumber *> *roomStates = [NSMutableArray array];
     NSArray *models = [self currentRowModels:tv];
@@ -2490,6 +2513,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 - (void)runJobChunk {
     UITableView *tv = self.jobTable;
     if (!tv || !self.jobRunning) { self.jobRunning = NO; return; }
+    NSInteger gen = self.jobGeneration;
 
     // 每个分块重新找一次勾选集 —— 微信可能每勾一次就换一个新数组
     WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels];
@@ -2535,8 +2559,14 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
 
     self.jobIndex = end;
     if (self.jobIndex < total) {
+        __weak WFManager *wself = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [self runJobChunk]; });
+                       dispatch_get_main_queue(), ^{
+            WFManager *sself = wself;
+            // 代次不符 = 这个块属于已被作废的旧任务，直接丢弃
+            if (!sself || sself.jobGeneration != gen || !sself.jobRunning) return;
+            [sself runJobChunk];
+        });
     } else {
         [self finishJob];
     }
@@ -2548,7 +2578,7 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels];
 
     NSMutableArray<NSNumber *> *retry = [NSMutableArray array];
-    NSInteger ok = 0, bad = 0, unknown = 0;
+    NSInteger ok = 0, bad = 0, unknown = 0, unreliable = 0;
     if (tv) {
         for (NSInteger i = 0; i < (NSInteger)self.jobTargets.count; i++) {
             NSInteger target = [self.jobTargets[(NSUInteger)i] integerValue];
@@ -2561,14 +2591,21 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
             if (cur < 0) { unknown++; continue; }
             if (cur == target) { ok++; continue; }
             bad++;
+            // 只有「依据可靠」的行才进补点队列。
+            // cell.isSelected 是粘性信号（点过一次就常驻为真），拿它去补点
+            // 等于闭着眼翻转 —— 万一读错，反而把已取消的行重新勾上。
+            if ([how isEqualToString:@"cell.isSelected"]) { unreliable++; continue; }
             [retry addObject:@(i)];
         }
     }
+    if (unreliable) WFLOG(@"复检：%ld 行状态不符但依据是粘性信号 cell.isSelected，不敢补点", (long)unreliable);
 
-    // 复检不符的行再补点一轮 —— 微信的勾选回调经常是异步的，第一次点不生效
-    if (tv && bad > 0 && self.jobRetryRound < 2) {
+    // 复检不符的行再补点一轮 —— 微信的勾选回调经常是异步的，第一次点不生效。
+    // 补点前必须重新读一次真实状态，确实不符才点。
+    if (tv && retry.count > 0 && self.jobRetryRound < 2) {
         self.jobRetryRound++;
-        WFLOG(@"复检不符 %ld 行，补第 %ld 轮点击", (long)bad, (long)self.jobRetryRound);
+        WFLOG(@"复检不符 %ld 行（可补点 %lu 行），补第 %ld 轮",
+              (long)bad, (unsigned long)retry.count, (long)self.jobRetryRound);
         id del = tv.delegate;
         for (NSNumber *n in retry) {
             NSInteger i = n.integerValue;
@@ -2578,6 +2615,13 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
                     [tv scrollToRowAtIndexPath:ip atScrollPosition:UITableViewScrollPositionMiddle animated:NO];
                     [tv layoutIfNeeded];
                 }
+                // 关键：点之前再读一次。已经对上了就不点，读不准也不点。
+                NSInteger target = [self.jobTargets[(NSUInteger)i] integerValue];
+                NSString *how2 = nil;
+                NSInteger cur2 = WFRowCheckedState(tv, ip, &how2);
+                if (cur2 < 0) { self.jobUnknown++; continue; }
+                if (cur2 == target) continue;
+                if ([how2 isEqualToString:@"cell.isSelected"]) continue;   // 依据不可靠，宁可不动
                 if (del) [del tableView:tv didSelectRowAtIndexPath:ip];
                 self.jobDone++;
             } @catch (NSException *e) {
@@ -2585,13 +2629,22 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
                 WFLOG(@"补点第 %ld 行异常：%@", (long)i, e.reason);
             }
         }
+        NSInteger gen = self.jobGeneration;
         __weak WFManager *wself = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [wself finishJob]; });
+                       dispatch_get_main_queue(), ^{
+            WFManager *sself = wself;
+            if (!sself || sself.jobGeneration != gen || !sself.jobRunning) return;
+            [sself finishJob];
+        });
         return;                     // 保持 jobRunning，避免补点期间被重复触发
     }
 
     self.jobRunning = NO;
+
+    // 收尾快照 + 回潮复查：任务刚结束的状态，以及 4 秒 / 10 秒后有没有自己变回去
+    [self jobSnapshotLog:[NSString stringWithFormat:@"%@ 刚结束", self.jobTitle ?: @"任务"]];
+    [self scheduleDriftCheckAfter:4.0 round:1];
 
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"%@ 完成\n\n", self.jobTitle];
@@ -2604,9 +2657,10 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
     [s appendFormat:@"\n复检：符合 %ld 行", (long)ok];
     if (bad) [s appendFormat:@"，不符合 %ld 行", (long)bad];
     if (unknown) [s appendFormat:@"，判不出 %ld 行", (long)unknown];
+    if (unreliable) [s appendFormat:@"\n依据太弱、没敢补点：%ld 行", (long)unreliable];
     [s appendString:@"\n\n"];
     if (bad == 0 && self.jobFail == 0 && self.jobUnknown == 0) {
-        [s appendString:@"确认没问题后，点微信自己的「完成」才会保存。"];
+        [s appendString:@"⚠️ 必须点微信自己的「完成」才会提交保存，只返回不点等于没改。"];
     } else {
         [s appendString:@"有对不上的地方。请「查看日志」→「复制全部」发我。"];
     }
@@ -2616,6 +2670,58 @@ static BOOL WFIsSettingVC(UIViewController *vc) {
           (long)self.jobUnknown, (long)self.jobFail, (long)ok, (long)bad, (long)unknown);
 
     [self alert:s from:WFTopViewController()];
+}
+
+// 把「每行期望什么、实际读到什么、依据是什么」写进日志。
+// 任务刚结束时调用一次，之后延迟再调用两次 —— 用来判断「取消完又自己变回勾选」
+// 到底是不是本插件干的：刚结束时是取消状态、过几秒自己变回勾选 → 一定是外部。
+- (void)jobSnapshotLog:(NSString *)tag {
+    UITableView *tv = self.jobTable;
+    if (!tv || !self.jobPaths.count || self.jobPaths.count != self.jobTargets.count) {
+        WFLOG(@"[快照] %@：页面已离开或列表结构变了，本次不复查", tag);
+        return;
+    }
+
+    WFSelectionRef *ref = [self findSelectionRef:self.jobVC models:self.jobModels];
+    NSInteger match = 0, mismatch = 0, unknowable = 0;
+    NSMutableString *det = [NSMutableString string];
+
+    for (NSInteger i = 0; i < (NSInteger)self.jobTargets.count; i++) {
+        NSInteger target = [self.jobTargets[(NSUInteger)i] integerValue];
+        if (target < 0) continue;                    // 跳过 / 置顶保护行不参与
+        NSIndexPath *ip = self.jobPaths[(NSUInteger)i];
+        NSString *how = nil;
+        NSInteger cur = WFRowCheckedState(tv, ip, &how);
+        if (cur < 0 && ref && (NSUInteger)i < self.jobModels.count)
+            cur = [ref stateForModel:self.jobModels[(NSUInteger)i]];
+        if (cur < 0) { unknowable++; continue; }
+        if (cur == target) { match++; continue; }
+        mismatch++;
+        [det appendFormat:@"    第 %ld 行：期望%@ 实际%@（依据 %@）\n",
+                          (long)i, target ? @"勾选" : @"取消", cur ? @"勾选" : @"取消", how ?: @"认亲集合"];
+    }
+
+    WFLOG(@"[快照] %@ → 符合 %ld / 不符 %ld / 判不出 %ld（当前勾选动作＝%@）",
+          tag, (long)match, (long)mismatch, (long)unknowable, self.jobTitle ?: @"?");
+    if (det.length) WFLOG(@"[快照] 不符明细：\n%@", det);
+}
+
+// 回潮复查：延迟若干秒后再读一遍状态，看有没有行自己变回「已勾选」。
+// 4 秒一次、再 6 秒一次（累计约 10 秒），两次都写日志。
+- (void)scheduleDriftCheckAfter:(NSTimeInterval)delay round:(NSInteger)round {
+    NSInteger gen = self.jobGeneration;
+    __weak WFManager *wself = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        WFManager *sself = wself;
+        if (!sself || sself.jobGeneration != gen) return;   // 期间又开了新任务就不查了
+        NSInteger shown = (round == 1) ? 4 : 10;            // 与下面的 4s / 6s 调度对应
+        [sself jobSnapshotLog:[NSString stringWithFormat:@"%@ 结束后 +%ld 秒复查",
+                               sself.jobTitle ?: @"任务", (long)shown]];
+        if (round >= 2) return;
+        WFManager *sself2 = wself;
+        if (sself2) [sself2 scheduleDriftCheckAfter:6.0 round:round + 1];
+    });
 }
 
 // 状态预览：把插件「读到了什么」直接显示在手机上，不用翻日志。
